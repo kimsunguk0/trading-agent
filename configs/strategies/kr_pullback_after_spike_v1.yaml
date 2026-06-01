@@ -1,0 +1,39 @@
+strategy_id: kr_pullback_after_spike_v1
+version: 1
+market: KR
+description: '급등 후 첫 눌림목 진입 전략'
+universe:
+  market_cap:
+    min_krw: 50_000_000_000
+    max_krw: 5_000_000_000_000
+  exclude: [trading_halt, management_issue, investment_warning]
+  liquidity:
+    min_avg_value_20d_krw: 3_000_000_000
+regime_filter:
+  enabled_regimes: [bull_trend, bull_volatile]
+  disabled_regimes: [bear_trend, panic, range]
+entry:
+  all_of:
+    - price.spike_pct_today >= 0.08
+    - price.pullback_from_high_pct >= 0.03
+    - price.pullback_from_high_pct <= 0.08
+    - volume.current_vs_spike_volume <= 0.3
+    - price.above_vwap == true
+exit:
+  stop_loss_pct: 0.030
+  take_profit:
+    - { pct: 0.05, qty_ratio: 0.6 }
+    - { pct: 0.10, qty_ratio: 0.4 }
+  time_stop_minutes: 90
+risk:
+  max_position_pct_nav: 0.02
+  max_daily_trades: 4
+  max_strategy_daily_loss_pct_nav: 0.01
+  max_concurrent_positions: 2
+execution:
+  order_type: limit
+  limit_price_basis: best_ask
+  max_slippage_pct: 0.003
+  allow_market_order: false
+approval:
+  mode: PAPER

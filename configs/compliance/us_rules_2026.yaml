@@ -1,0 +1,8 @@
+version: 2026.05
+effective_from: 2026-01-01
+us:
+  pattern_day_trader:
+    min_account_equity_usd: 25000
+    max_daytrades_per_5_days: 3
+  wash_sale_days: 30
+  extended_hours: false

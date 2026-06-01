@@ -1,0 +1,25 @@
+global_risk:
+  max_position_pct_nav: 0.02
+  max_symbol_exposure_pct_nav: 0.03
+  max_daily_loss_pct_nav: 0.01
+  max_weekly_loss_pct_nav: 0.03
+  max_monthly_loss_pct_nav: 0.08
+  max_orders_per_day: 20
+  max_orders_per_symbol_per_day: 3
+  max_concurrent_positions: 10
+  cash_reserve_pct: 0.10
+  allow_short: false
+  allow_margin: false
+  allow_market_order: false
+  require_manual_approval_for_live: true
+per_market:
+  KR:
+    max_exposure_pct_nav: 0.60
+    trading_hours_only: true
+  US:
+    max_exposure_pct_nav: 0.50
+    extended_hours: false
+per_strategy:
+  kr_news_breakout_v1:
+    max_daily_loss_pct_nav: 0.01
+    max_concurrent_positions: 3

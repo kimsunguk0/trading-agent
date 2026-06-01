@@ -1,0 +1,63 @@
+# Live-mode overrides for docker-compose.mvp0.yml.
+#
+# 실행:
+#   docker compose -f docker-compose.mvp0.yml -f docker-compose.live.yml --env-file .env.live up -d
+
+version: "3.9"
+
+x-live-env: &live-env
+  ENVIRONMENT: live
+  DB_SCHEMA: trading_live
+  REDIS_STREAM_PREFIX: live.events
+  BROKER_KEY_ENV: live
+  OPERATING_MODE: ${OPERATING_MODE:-LIVE_APPROVAL}
+
+services:
+  api:
+    environment:
+      <<: *live-env
+
+  worker-execution:
+    environment:
+      <<: *live-env
+      BROKER_ADAPTER: ${BROKER_ADAPTER:?set live broker adapter}
+
+  worker-monitor:
+    environment:
+      <<: *live-env
+      BROKER_ADAPTER: ${BROKER_ADAPTER:?set live broker adapter}
+
+  worker-market-kr:
+    environment:
+      <<: *live-env
+      MARKET: KR
+      BROKER_ADAPTER: ${BROKER_ADAPTER_KR:-kiwoom_live}
+
+  worker-market-us:
+    environment:
+      <<: *live-env
+      MARKET: US
+      BROKER_ADAPTER: ${BROKER_ADAPTER_US:-kis_overseas_live}
+
+  worker-agent:
+    environment:
+      <<: *live-env
+
+  worker-strategy:
+    environment:
+      <<: *live-env
+      ACCOUNT_ID: ${ACCOUNT_ID:?set live account id}
+
+networks:
+  trading_net:
+    name: trading_live_net
+
+volumes:
+  postgres_data:
+    name: trading_live_postgres_data
+  redis_data:
+    name: trading_live_redis_data
+  minio_data:
+    name: trading_live_minio_data
+  qdrant_data:
+    name: trading_live_qdrant_data

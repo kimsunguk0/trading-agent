@@ -1,0 +1,34 @@
+strategy_id: kr_mean_reversion_v1
+version: 1
+market: KR
+description: '코스피200 평균회귀 전략 — RSI 과매도 반등'
+universe:
+  index: KOSPI200
+  exclude: [trading_halt]
+regime_filter:
+  enabled_regimes: [range, bear_trend]
+  disabled_regimes: [panic]
+entry:
+  all_of:
+    - indicators.rsi_14 <= 30
+    - price.above_200ma == false
+    - price.distance_from_200ma_pct >= -0.10
+    - volume.above_avg_20d == true
+exit:
+  stop_loss_pct: 0.020
+  take_profit:
+    - { pct: 0.03, qty_ratio: 0.5 }
+    - { pct: 0.06, qty_ratio: 0.5 }
+  time_stop_minutes: 180
+risk:
+  max_position_pct_nav: 0.015
+  max_daily_trades: 2
+  max_strategy_daily_loss_pct_nav: 0.008
+  max_concurrent_positions: 3
+execution:
+  order_type: limit
+  limit_price_basis: mid
+  max_slippage_pct: 0.002
+  allow_market_order: false
+approval:
+  mode: PAPER

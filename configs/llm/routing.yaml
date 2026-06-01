@@ -1,0 +1,29 @@
+roles:
+  decision_engine:
+    role: candidate_ranking_and_explanation
+    primary: local-qwen-35b-a3b
+    fallback: claude-sonnet
+    may_create_signal: true
+    may_create_order_intent: false
+    may_place_order: false
+    require_json_schema: true
+  final_decision_policy:
+    role: deterministic_policy_engine
+    may_create_order_intent: true
+execution:
+  news_analyst:
+    primary: local-qwen-35b-a3b
+    fallback: claude-haiku
+    cache_ttl_seconds: 3600
+  catalyst_hunter:
+    primary: local-qwen-35b-a3b
+    fallback: claude-haiku
+  daily_briefing:
+    primary: claude-sonnet
+  post_mortem:
+    primary: claude-sonnet
+    schedule: after_market_close
+  conversational_control:
+    primary: claude-sonnet
+  embedding:
+    primary: local-bge-m3

@@ -1,0 +1,62 @@
+# Paper-mode overrides for docker-compose.mvp0.yml.
+#
+# 실행:
+#   docker compose -f docker-compose.mvp0.yml -f docker-compose.paper.yml --env-file .env.paper up -d
+
+version: "3.9"
+
+x-paper-env: &paper-env
+  ENVIRONMENT: paper
+  DB_SCHEMA: trading_paper
+  REDIS_STREAM_PREFIX: paper.events
+  BROKER_KEY_ENV: paper
+
+services:
+  api:
+    environment:
+      <<: *paper-env
+
+  worker-execution:
+    environment:
+      <<: *paper-env
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-simulated}
+
+  worker-monitor:
+    environment:
+      <<: *paper-env
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-simulated}
+
+  worker-market-kr:
+    environment:
+      <<: *paper-env
+      MARKET: KR
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-simulated}
+
+  worker-market-us:
+    environment:
+      <<: *paper-env
+      MARKET: US
+      BROKER_ADAPTER: ${BROKER_ADAPTER_US:-kis_overseas_mock}
+
+  worker-agent:
+    environment:
+      <<: *paper-env
+
+  worker-strategy:
+    environment:
+      <<: *paper-env
+      ACCOUNT_ID: ${ACCOUNT_ID:-default}
+
+networks:
+  trading_net:
+    name: trading_paper_net
+
+volumes:
+  postgres_data:
+    name: trading_paper_postgres_data
+  redis_data:
+    name: trading_paper_redis_data
+  minio_data:
+    name: trading_paper_minio_data
+  qdrant_data:
+    name: trading_paper_qdrant_data

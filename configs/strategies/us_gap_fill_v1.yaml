@@ -1,0 +1,36 @@
+strategy_id: us_gap_fill_v1
+version: 1
+market: US
+description: '갭 메꿈 전략 — 전일 종가 대비 갭 하락 후 회복'
+universe:
+  market_cap_usd:
+    min: 500_000_000
+  exclude: [trading_halt]
+  liquidity:
+    min_avg_volume_20d: 500_000
+regime_filter:
+  enabled_regimes: [bull_trend, range]
+  disabled_regimes: [panic, bear_trend]
+entry:
+  all_of:
+    - price.gap_down_pct >= 0.02
+    - price.gap_down_pct <= 0.07
+    - price.first_candle_direction == up
+    - volume.open_30min_vs_avg >= 2.0
+exit:
+  stop_loss_pct: 0.025
+  take_profit:
+    - { pct: 0.02, qty_ratio: 1.0 }
+  time_stop_minutes: 120
+risk:
+  max_position_pct_nav: 0.015
+  max_daily_trades: 2
+  max_strategy_daily_loss_pct_nav: 0.008
+  max_concurrent_positions: 2
+execution:
+  order_type: limit
+  limit_price_basis: best_ask
+  max_slippage_pct: 0.004
+  allow_market_order: false
+approval:
+  mode: LIVE_APPROVAL

@@ -1,0 +1,14 @@
+version: 2026.05
+effective_from: 2026-01-01
+kr:
+  max_orders_per_minute: 30
+  max_cancel_rate_pct: 30
+  forbidden_patterns:
+    - spoofing
+    - layering
+    - momentum_ignition
+  blacklist_symbols: []
+  api_rate_limit_per_second: 5
+  algorithmic_trader:
+    threshold_orders_per_day: 1000
+    registered: false

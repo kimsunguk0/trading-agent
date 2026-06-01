@@ -1,0 +1,12 @@
+catalyst_score:
+  weights:
+    source_quality: 0.25
+    novelty_score: 0.20
+    financial_materiality: 0.20
+    time_sensitivity: 0.15
+    sector_momentum: 0.10
+    price_volume_confirmation: 0.10
+  thresholds:
+    consider: 0.55
+    strong: 0.72
+    very_strong: 0.85

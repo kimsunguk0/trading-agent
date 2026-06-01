@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-trading-mvp0"
+version = "0.0.0"
+description = "MVP 0 skeleton for simulated trading system"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg",
+    "aiohttp",
+    "redis[hiredis]",
+    "pydantic>=2",
+    "fastapi",
+    "uvicorn",
+    "openai",
+    "python-telegram-bot",
+    "pyyaml",
+    "exchange_calendars",
+    "httpx",
+    "pytest",
+    "pytest-asyncio",
+    "websockets",
+    "qdrant-client>=1.7",
+    "langdetect",
+    "anthropic",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "brokers*", "apps*", "agents*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

@@ -1,0 +1,4 @@
+market: KR
+taker_fee_bps: 15
+maker_fee_bps: 5
+currency: KRW

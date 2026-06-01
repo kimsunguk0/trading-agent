@@ -1,0 +1,14 @@
+regime_v1:
+  lookback_days: 20
+  bull_trend:
+    price_above_ma20: true
+    atr_pct_max: 0.025
+  bull_volatile:
+    price_above_ma20: true
+    atr_pct_min: 0.025
+  range:
+    ma20_deviation_pct_max: 0.02
+  bear_trend:
+    price_below_ma20: true
+  panic:
+    atr_pct_min: 0.04

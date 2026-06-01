@@ -1,0 +1,374 @@
+# MVP 0 docker-compose
+#
+# 외부 API 0개. SimulatedBrokerAdapter로 풀 사이클 검증.
+# 8개 컨테이너: postgres, redis, minio + api, worker-market, worker-execution, worker-monitor, bot-telegram
+#
+# 실행:
+#   docker compose -f docker-compose.base.yml -f docker-compose.paper.yml --env-file .env.paper up -d
+
+# ========================================
+# docker-compose.base.yml — 인프라 공통
+# ========================================
+version: "3.9"
+
+x-restart-policy: &restart-policy
+  restart: unless-stopped
+
+x-worker-restart: &worker-restart
+  restart: always
+
+x-common-env: &common-env
+  TZ: Asia/Seoul
+  PYTHONUNBUFFERED: "1"
+  ENVIRONMENT: ${ENVIRONMENT}             # 'paper' | 'live' — .env 파일에서 주입
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+
+  # ============================
+  # Infra 그룹
+  # ============================
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    <<: *restart-policy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}          # trading_paper or trading_live
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+
+  redis:
+    image: redis:7-alpine
+    <<: *restart-policy
+    command: >
+      redis-server
+      --maxmemory 1500mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  minio:
+    image: minio/minio:latest
+    <<: *restart-policy
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ============================
+  # Critical 그룹 (Infra에만 의존)
+  # ============================
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    <<: *worker-restart
+    environment:
+      <<: *common-env
+      WORKER_NAME: api
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+    ports:
+      - "127.0.0.1:8080:8000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  worker-execution:
+    build:
+      context: .
+      dockerfile: apps/worker_execution/Dockerfile
+    <<: *worker-restart
+    environment:
+      <<: *common-env
+      WORKER_NAME: worker-execution
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-simulated}    # MVP 0: simulated
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-m", "core.healthcheck", "execution"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 30s
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  worker-monitor:
+    # Critical 그룹 — 다른 모든 게 죽어도 살아있어야 함
+    build:
+      context: .
+      dockerfile: apps/worker_monitor/Dockerfile
+    <<: *worker-restart
+    environment:
+      <<: *common-env
+      WORKER_NAME: worker-monitor
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-simulated}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-m", "core.healthcheck", "monitor", "--strict"]
+      interval: 5s              # Critical은 더 자주 체크
+      timeout: 3s
+      retries: 2
+      start_period: 20s
+    stop_grace_period: 30s
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  bot-telegram:
+    build:
+      context: .
+      dockerfile: apps/bot_telegram/Dockerfile
+    <<: *worker-restart
+    environment:
+      <<: *common-env
+      WORKER_NAME: bot-telegram
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+      API_URL: http://api:8000
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS}
+    depends_on:
+      redis: { condition: service_healthy }
+      api:   { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-m", "core.healthcheck", "telegram"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ============================
+  # Data 그룹
+  # ============================
+  worker-market-kr:
+    build:
+      context: .
+      dockerfile: apps/worker_market/Dockerfile
+    <<: *worker-restart
+    environment:
+      <<: *common-env
+      WORKER_NAME: worker-market-kr
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+      MARKET: KR
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-simulated}   # MVP 0: 시뮬레이션 시세
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-m", "core.healthcheck", "market"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  worker-market-us:
+    build:
+      context: .
+      dockerfile: apps/worker_market/Dockerfile
+    <<: *worker-restart
+    environment:
+      <<: *common-env
+      WORKER_NAME: worker-market-us
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+      MARKET: US
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-kis_overseas_mock}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-m", "core.healthcheck", "market"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    <<: *restart-policy
+    ports:
+      - '127.0.0.1:6333:6333'
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [trading_net]
+
+  # =========================================
+  # MVP2 추가: News/Decision workers
+  # =========================================
+  worker-agent:
+    build:
+      context: .
+      dockerfile: apps/worker_agent/Dockerfile
+    <<: *restart-policy
+    environment:
+      <<: *common-env
+      WORKER_NAME: worker-agent
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+      ENVIRONMENT: ${ENVIRONMENT}
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-simulated}
+      LLM_API_URL: ${LLM_API_URL:-http://localhost:8000/v1}
+      LLM_MODEL: ${LLM_MODEL:-Qwen/Qwen3.6-35B-A3B}
+      LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-claude-haiku-4-5-20251001}
+      WORKER_AGENT_GROUP: worker-agent-news
+      WORKER_AGENT_CONSUMER: worker-agent-news-0
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-m", "core.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [trading_net]
+
+  worker-strategy:
+    build:
+      context: .
+      dockerfile: apps/worker_strategy/Dockerfile
+    <<: *restart-policy
+    environment:
+      <<: *common-env
+      WORKER_NAME: worker-strategy
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+      ENVIRONMENT: ${ENVIRONMENT}
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-simulated}
+      ACCOUNT_ID: ${ACCOUNT_ID:-default}
+      WORKER_STRATEGY_SIGNAL_GROUP: worker-strategy-signal
+      WORKER_STRATEGY_SIGNAL_CONSUMER: worker-strategy-signal-0
+      WORKER_STRATEGY_TICK_GROUP: worker-strategy-tick
+      WORKER_STRATEGY_TICK_CONSUMER: worker-strategy-tick-0
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-m", "core.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [trading_net]
+
+networks:
+  trading_net:
+    driver: bridge
+    name: trading_${ENVIRONMENT}_net      # paper와 live 네트워크 격리
+
+volumes:
+  postgres_data:
+    name: trading_${ENVIRONMENT}_postgres_data
+  redis_data:
+    name: trading_${ENVIRONMENT}_redis_data
+  minio_data:
+    name: trading_${ENVIRONMENT}_minio_data
+  qdrant_data:
+    name: trading_${ENVIRONMENT}_qdrant_data
+
+# ========================================
+# .env.paper (예시 — 별도 파일로 저장)
+# ========================================
+# ENVIRONMENT=paper
+# LOG_LEVEL=INFO
+#
+# POSTGRES_USER=trading
+# POSTGRES_PASSWORD=<생성된 비밀번호>
+# POSTGRES_DB=trading_paper
+#
+# MINIO_ROOT_USER=trading_paper
+# MINIO_ROOT_PASSWORD=<생성된 비밀번호>
+#
+# BROKER_ADAPTER=simulated
+#
+# TELEGRAM_BOT_TOKEN=<paper 전용 봇 토큰>
+# TELEGRAM_ALLOWED_USER_IDS=123456789

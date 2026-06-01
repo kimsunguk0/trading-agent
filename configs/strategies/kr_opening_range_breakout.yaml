@@ -1,0 +1,22 @@
+strategy_id: kr_opening_range_breakout
+version: 1
+market: KR
+description: "Korean opening range breakout (first 30 minutes)"
+symbols:
+  - "005930"
+  - "066570"
+  - "000660"
+entry:
+  strategy_type: opening_range_breakout
+  opening_range_minutes: 30
+  breakout_up_pct: 0.0025
+  breakout_down_pct: 0.0025
+  allow_short: false
+execution:
+  order_type: MARKET
+  quantity: 1
+signal_score: 1.0
+exit:
+  stop_loss_pct: 0.02
+  take_profit_pct: 0.04
+  end_of_day_exit: true

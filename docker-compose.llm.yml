@@ -1,0 +1,87 @@
+# LLM 서버 (MVP 2+)
+# 실행:
+#   docker compose -f docker-compose.mvp0.yml -f docker-compose.llm.yml --env-file .env.paper up -d
+
+version: "3.9"
+
+services:
+
+  # ============================
+  # GPU 그룹: vLLM OpenAI-compatible LLM
+  # ============================
+  llm-server:
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      VLLM_GPU_MEMORY_UTILIZATION: "0.85"
+      HF_HOME: /models/huggingface
+    volumes:
+      - ./models:/models
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks: [trading_net]
+    command:
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --model
+      - Qwen/Qwen3.6-35B-A3B
+      - --served-model-name
+      - Qwen/Qwen3.6-35B-A3B
+      - --gpu-memory-utilization
+      - "0.85"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              device_ids:
+                - nvidia.com/gpu=0
+              capabilities: [gpu]
+        limits:
+          memory: 8G
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/models')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  # ============================
+  # GPU 그룹: 임베딩 서버 (bge-m3)
+  # ============================
+  embedding-server:
+    build:
+      context: .
+      dockerfile: infra/embedding/Dockerfile
+    restart: unless-stopped
+    environment:
+      MODEL_PATH: /models/bge-m3
+    volumes:
+      - ./models/bge-m3:/models/bge-m3:ro
+    ports:
+      - "127.0.0.1:8001:8001"
+    networks: [trading_net]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              device_ids:
+                - nvidia.com/gpu=0
+              capabilities: [gpu]
+        limits:
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+networks:
+  trading_net:
+    external: true
+    name: trading_paper_net

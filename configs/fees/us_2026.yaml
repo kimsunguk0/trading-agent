@@ -1,0 +1,10 @@
+version: 2026.05
+effective_from: 2026-01-01
+stocks:
+  buy:
+    commission_pct: 0.0
+  sell:
+    commission_pct: 0.0
+    sec_fee_per_dollar: 0.000008
+    finra_taf_per_share: 0.000166
+exchange_rate_source: kis_daily

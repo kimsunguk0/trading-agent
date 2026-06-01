@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+# dotenv (commit only *.example)
+.env
+.env.*
+!.env.*.example
+
+# Model weights (large; never version-controlled)
+models/
+
+# Local tooling / agent state
+.vscode/
+.claude/
+.codex/
+.agents/
+
+# Python cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
