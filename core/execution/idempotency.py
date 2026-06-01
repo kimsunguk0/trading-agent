@@ -69,6 +69,7 @@ class OrderIdempotencyManager:
         self.redis_prefix = redis_prefix or os.getenv("REDIS_STREAM_PREFIX", "paper.events")
         self._redis_failed = False
         self._lock = asyncio.Lock()
+        self._finalized_intents: set[str] = set()
 
     def _block_key(self, request: OrderRequest) -> str:
         return f"{request.account_id}:{request.symbol}:{request.side}"
@@ -106,6 +107,8 @@ class OrderIdempotencyManager:
         self._states[key] = record
         if status in self.ACTIVE_STATUSES:
             self._by_block_key.setdefault(self._block_key_from_record(record), set()).add(key)
+        else:
+            self._finalized_intents.add(order_intent_id)
 
     def _forget(self, order_intent_id: str) -> str | None:
         key = self._by_intent.get(order_intent_id)
@@ -151,6 +154,7 @@ class OrderIdempotencyManager:
 
     def mark_finalized(self, request: OrderRequest) -> None:
         self._forget(request.order_intent_id)
+        self._finalized_intents.add(request.order_intent_id)
 
     async def load(self) -> None:
         """Load active idempotency records from DB, or Redis when DB is absent."""
@@ -158,6 +162,7 @@ class OrderIdempotencyManager:
         self._by_intent.clear()
         self._by_block_key.clear()
         self._states.clear()
+        self._finalized_intents.clear()
 
         if self.dsn:
             await self._load_from_db()
@@ -177,6 +182,8 @@ class OrderIdempotencyManager:
 
     async def try_reserve_async(self, request: OrderRequest) -> str | None:
         async with self._lock:
+            if request.order_intent_id in self._finalized_intents:
+                return None
             if not self.can_submit(request):
                 return None
             key = self.reserve(request)
@@ -218,9 +225,7 @@ class OrderIdempotencyManager:
                     status,
                     created_at
                 FROM {self.schema}.order_intents
-                WHERE status = ANY($1::text[])
                 """,
-                list(self.ACTIVE_STATUSES),
             )
         finally:
             await conn.close()
@@ -332,7 +337,7 @@ class OrderIdempotencyManager:
             try:
                 payload = json.loads(raw)
                 status = str(payload.get("status", ""))
-                if status not in self.ACTIVE_STATUSES:
+                if not status:
                     continue
                 created_at = datetime.fromisoformat(str(payload["created_at"]))
                 if created_at.tzinfo is None:

@@ -61,6 +61,34 @@ if importlib.util.find_spec("redis") is None and "redis" not in sys.modules:
     sys.modules["redis.asyncio"] = redis_asyncio
 
 
+if importlib.util.find_spec("fastapi") is None and "fastapi" not in sys.modules:
+    fastapi = types.ModuleType("fastapi")
+
+    class APIRouter:
+        def get(self, *_args, **_kwargs):
+            return lambda func: func
+
+        def post(self, *_args, **_kwargs):
+            return lambda func: func
+
+    class FastAPI:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def on_event(self, *_args, **_kwargs):
+            return lambda func: func
+
+        def get(self, *_args, **_kwargs):
+            return lambda func: func
+
+        def include_router(self, *_args, **_kwargs) -> None:
+            return None
+
+    fastapi.APIRouter = APIRouter
+    fastapi.FastAPI = FastAPI
+    sys.modules["fastapi"] = fastapi
+
+
 if importlib.util.find_spec("qdrant_client") is None and "qdrant_client" not in sys.modules:
     qdrant_client = types.ModuleType("qdrant_client")
 
