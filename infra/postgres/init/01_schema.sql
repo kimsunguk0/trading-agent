@@ -111,6 +111,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS trading_controls (
+    control_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    blocked BOOLEAN NOT NULL DEFAULT TRUE,
+    reason TEXT,
+    updated_by TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (control_type, target)
+);
+
 SET search_path TO trading_live;
 
 CREATE TABLE IF NOT EXISTS accounts (
@@ -219,4 +229,14 @@ CREATE TABLE IF NOT EXISTS audit_log (
     target_id TEXT,
     payload JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS trading_controls (
+    control_type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    blocked BOOLEAN NOT NULL DEFAULT TRUE,
+    reason TEXT,
+    updated_by TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (control_type, target)
 );

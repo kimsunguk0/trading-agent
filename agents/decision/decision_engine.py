@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from core.models.market import Side
 from core.models.order import OrderRequest, RiskCheckResult
 from core.models.portfolio import Account
 from core.risk.gate import RiskGate
+from core.trading_controls import is_entry_allowed
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -138,6 +140,28 @@ class DecisionEngine:
         order_type = str(signal.payload.get("order_type", "MARKET"))
 
         market = self._market_from_signal(signal)
+        if signal.side == Side.BUY:
+            environment = os.getenv("ENVIRONMENT", "paper").lower()
+            allowed, reason = await is_entry_allowed(
+                signal.symbol.value,
+                market,
+                environment=environment,
+                dsn=os.getenv("DATABASE_URL"),
+                redis_url=getattr(self.bus, "redis_url", os.getenv("REDIS_URL", "")),
+                stream_prefix=getattr(self.bus, "stream_prefix", os.getenv("REDIS_STREAM_PREFIX", f"{environment}.events")),
+            )
+            if not allowed:
+                await self.bus.publish(
+                    RiskEvent(
+                        event_type=EventType.RISK,
+                        order_intent_id=f"CONTROL-{market}-{signal.symbol.value}",
+                        stage="trading_control",
+                        passed=False,
+                        reason=reason,
+                    )
+                )
+                return None
+
         order_intent_id = self.policy.next_order_intent_id(market, signal.symbol.value)
 
         request = OrderRequest(

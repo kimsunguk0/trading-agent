@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -13,6 +14,11 @@ try:
     import asyncpg
 except Exception:  # pragma: no cover
     asyncpg = None
+
+try:
+    import redis.asyncio as redis
+except Exception:  # pragma: no cover
+    redis = None
 
 
 class SystemState(str, Enum):
@@ -162,14 +168,40 @@ class SystemStateManager:
             "paper",
         }
 
+    async def _publish_state_event_async(self, state: SystemState, reason: str, triggered_by: str) -> None:
+        if redis is None or not self.redis_url:
+            return
+
+        client = redis.from_url(self.redis_url, decode_responses=True)
+        try:
+            payload = {
+                "event_type": "system_state",
+                "environment": self.environment,
+                "state": state.value,
+                "reason": reason,
+                "triggered_by": triggered_by,
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+            }
+            await client.xadd(f"{self.stream_prefix}.system_state", {"payload": json.dumps(payload, ensure_ascii=False)})
+        except Exception:
+            return
+        finally:
+            closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+            if closer is not None:
+                result = closer()
+                if hasattr(result, "__await__"):
+                    await result
+
     def _publish_state_event(self, state: SystemState, reason: str, triggered_by: str) -> None:
-        # Logging via DB is the authoritative sink; Redis publish is optional.
-        _ = (state, reason, triggered_by)
+        self._schedule_async(self._publish_state_event_async(state, reason, triggered_by))
 
     def _schedule_async(self, coro: Any) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            closer = getattr(coro, "close", None)
+            if callable(closer):
+                closer()
             return
         loop.create_task(coro)
 
