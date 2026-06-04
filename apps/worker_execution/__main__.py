@@ -20,6 +20,21 @@ try:
 except ImportError:  # pragma: no cover - optional dependency fallback
     KiwoomRestKrMockAdapter = None
 
+try:
+    from brokers.kiwoom_rest_kr_live import KiwoomRestKrLiveAdapter
+except ImportError:  # pragma: no cover - optional dependency fallback
+    KiwoomRestKrLiveAdapter = None
+
+try:
+    from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
+except ImportError:  # pragma: no cover - optional dependency fallback
+    KISDomesticKrMockAdapter = None
+
+try:
+    from brokers.kis_domestic_kr_live import KISDomesticKrLiveAdapter
+except ImportError:  # pragma: no cover - optional dependency fallback
+    KISDomesticKrLiveAdapter = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +62,27 @@ def _select_broker() -> tuple[object, bool]:
     elif adapter_name == "kiwoom_mock":
         logger.warning("Kiwoom mock adapter import failed; using simulated-only mode.")
         return SimulatedBrokerAdapter(), True
+    elif adapter_name == "kiwoom_live" and KiwoomRestKrLiveAdapter is not None:
+        try:
+            adapter = KiwoomRestKrLiveAdapter()
+        except Exception:
+            logger.warning("Failed to initialize Kiwoom live adapter; using simulated broker.", exc_info=True)
+            return SimulatedBrokerAdapter(), True
+    elif adapter_name == "kiwoom_live":
+        logger.warning("Kiwoom live adapter import failed; using simulated-only mode.")
+        return SimulatedBrokerAdapter(), True
+    elif adapter_name in {"kis_kr_mock", "kis_domestic_mock", "kis_domestic_kr_mock"} and KISDomesticKrMockAdapter is not None:
+        try:
+            adapter = KISDomesticKrMockAdapter()
+        except Exception:
+            logger.warning("Failed to initialize KIS KR mock adapter; using simulated broker.", exc_info=True)
+            return SimulatedBrokerAdapter(), True
+    elif adapter_name in {"kis_kr_live", "kis_domestic_live", "kis_domestic_kr_live"} and KISDomesticKrLiveAdapter is not None:
+        try:
+            adapter = KISDomesticKrLiveAdapter()
+        except Exception:
+            logger.warning("Failed to initialize KIS KR live adapter; using simulated broker.", exc_info=True)
+            return SimulatedBrokerAdapter(), True
     else:
         adapter = SimulatedBrokerAdapter()
 

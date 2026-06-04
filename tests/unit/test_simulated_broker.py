@@ -58,6 +58,8 @@ async def test_simulated_unknown_timeout(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_simulated_rejection_insufficient_cash() -> None:
     adapter = SimulatedBrokerAdapter(initial_cash=Decimal("10"))
+    adapter.delay_probability = Decimal("0")
+    adapter.timeout_probability = Decimal("0")
     request = OrderRequest(
         account_id="acc",
         symbol="005930",

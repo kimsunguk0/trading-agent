@@ -10,6 +10,8 @@ import json
 
 import asyncpg
 
+from brokers.kis_domestic_kr_live import KISDomesticKrLiveAdapter
+from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
 from brokers.kiwoom_rest_kr_live import KiwoomRestKrLiveAdapter
 from brokers.kiwoom_rest_kr_mock import KiwoomRestKrMockAdapter
 from brokers.simulated import SimulatedBrokerAdapter
@@ -31,6 +33,10 @@ def _select_broker() -> object:
         return KiwoomRestKrMockAdapter()
     if adapter == "kiwoom_live":
         return KiwoomRestKrLiveAdapter()
+    if adapter in {"kis_kr_mock", "kis_domestic_mock", "kis_domestic_kr_mock"}:
+        return KISDomesticKrMockAdapter()
+    if adapter in {"kis_kr_live", "kis_domestic_live", "kis_domestic_kr_live"}:
+        return KISDomesticKrLiveAdapter()
     return SimulatedBrokerAdapter()
 
 
@@ -80,7 +86,13 @@ class ReconciliationMonitor:
         if hasattr(self.broker, "get_positions") and callable(self.broker.get_positions):
             positions = await self.broker.get_positions(self.account_id)  # type: ignore[misc]
             if isinstance(positions, dict):
-                return {str(symbol): _to_decimal(qty) for symbol, qty in positions.items()}
+                normalized: dict[str, Decimal] = {}
+                for symbol, value in positions.items():
+                    if isinstance(value, dict):
+                        normalized[str(symbol)] = _to_decimal(value.get("quantity"))
+                    else:
+                        normalized[str(symbol)] = _to_decimal(value)
+                return normalized
 
         mapping = getattr(self.broker, "_positions", {})
         if isinstance(mapping, dict):

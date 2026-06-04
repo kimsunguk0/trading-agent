@@ -15,6 +15,8 @@ import redis.asyncio as redis
 
 from brokers.kiwoom_rest_kr_live import KiwoomRestKrLiveAdapter
 from brokers.kiwoom_rest_kr_mock import KiwoomRestKrMockAdapter
+from brokers.kis_domestic_kr_live import KISDomesticKrLiveAdapter
+from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
 from brokers.kis_overseas_live import KISOverseasLiveAdapter
 from brokers.kis_overseas_mock import KISOverseasMockAdapter
 from brokers.simulated import SimulatedBrokerAdapter
@@ -111,6 +113,11 @@ def _select_broker() -> tuple[object, bool]:
 
     if adapter_name in {"kiwoom_mock", "kiwoom_live"}:
         return KiwoomRestKrMockAdapter() if adapter_name == "kiwoom_mock" else KiwoomRestKrLiveAdapter(), False
+
+    if adapter_name in {"kis_kr_mock", "kis_domestic_mock", "kis_domestic_kr_mock"}:
+        return KISDomesticKrMockAdapter(), False
+    if adapter_name in {"kis_kr_live", "kis_domestic_live", "kis_domestic_kr_live"}:
+        return KISDomesticKrLiveAdapter(), False
 
     return SimulatedBrokerAdapter(), True
 
@@ -212,7 +219,7 @@ async def _watch_simulated(
 
 
 async def _watch_streamed(
-    broker: KiwoomRestKrMockAdapter | KiwoomRestKrLiveAdapter,
+    broker: KiwoomRestKrMockAdapter | KiwoomRestKrLiveAdapter | KISDomesticKrMockAdapter | KISDomesticKrLiveAdapter,
     symbols: list[str],
     market: str,
 ) -> AsyncIterator[MarketTickEvent]:
@@ -319,7 +326,7 @@ async def main() -> None:
     fx_task = asyncio.create_task(_refresh_fx_loop(market, broker, environment, redis_url))
 
     try:
-        if isinstance(broker, KiwoomRestKrMockAdapter) or isinstance(broker, KiwoomRestKrLiveAdapter):
+        if isinstance(broker, (KiwoomRestKrMockAdapter, KiwoomRestKrLiveAdapter, KISDomesticKrMockAdapter, KISDomesticKrLiveAdapter)):
             tick_iter = _watch_streamed(broker, symbols, market)
         elif isinstance(broker, (KISOverseasMockAdapter, KISOverseasLiveAdapter)):
             tick_iter = _watch_polling(broker, symbols, market)

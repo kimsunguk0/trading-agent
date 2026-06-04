@@ -213,12 +213,15 @@ class DecisionEngine:
 async def main() -> None:
     import os
 
+    from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
     from brokers.simulated import SimulatedBrokerAdapter
     from brokers.kiwoom_rest_kr_mock import KiwoomRestKrMockAdapter
 
     adapter_name = os.getenv("BROKER_ADAPTER", "simulated").lower()
     if adapter_name == "kiwoom_mock":
         broker = KiwoomRestKrMockAdapter()
+    elif adapter_name in {"kis_kr_mock", "kis_domestic_mock", "kis_domestic_kr_mock"}:
+        broker = KISDomesticKrMockAdapter()
     else:
         broker = SimulatedBrokerAdapter()
 

@@ -15,6 +15,7 @@ from agents.context.liquidity import load_liquidity_snapshot
 from agents.context.market_regime import MarketRegimeWorker
 from agents.decision.decision_engine import DecisionEngine
 from agents.decision.strategy_engine import StrategyEngine
+from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
 from brokers.kiwoom_rest_kr_mock import KiwoomRestKrMockAdapter
 from brokers.simulated import SimulatedBrokerAdapter
 from core.events.bus import RedisStreamBus
@@ -46,6 +47,8 @@ def _select_broker() -> object:
     adapter_name = os.getenv("BROKER_ADAPTER", "simulated").lower()
     if adapter_name == "kiwoom_mock":
         return KiwoomRestKrMockAdapter()
+    if adapter_name in {"kis_kr_mock", "kis_domestic_mock", "kis_domestic_kr_mock"}:
+        return KISDomesticKrMockAdapter()
     return SimulatedBrokerAdapter()
 
 
