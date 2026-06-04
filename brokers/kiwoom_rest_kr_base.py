@@ -192,7 +192,7 @@ class KiwoomRestKrBaseAdapter:
             raise ValueError("KIWOOM_ACCOUNT_NO is required")
 
         self.base_url = (base_url or os.getenv("KIWOOM_BASE_URL") or self.default_base_url).rstrip("/")
-        self.websocket_url = websocket_url or os.getenv("KIWOOM_WEBSOCKET_URL") or self.default_websocket_url
+        self.websocket_url = websocket_url or os.getenv("KIWOOM_WS_URL") or os.getenv("KIWOOM_WEBSOCKET_URL") or self._derive_websocket_url()
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=10.0, transport=transport)
         self._rate_limiter = _AsyncRateLimiter(max_requests_per_second=rate_limit)
         self._access_token: str | None = None
@@ -203,6 +203,15 @@ class KiwoomRestKrBaseAdapter:
 
     def _now(self) -> datetime:
         return _now()
+
+    def _derive_websocket_url(self) -> str:
+        try:
+            host = httpx.URL(self.base_url).host
+        except Exception:
+            host = None
+        if not host:
+            return self.default_websocket_url
+        return f"wss://{host}:10000/api/dostk/websocket"
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -568,61 +577,149 @@ class KiwoomRestKrBaseAdapter:
             return None
         return payload if isinstance(payload, dict) else None
 
-    async def _ws_login_and_register(self, ws: Any, registrations: list[dict[str, Any]]) -> None:
+    def _check_ws_response(self, frame: dict[str, Any] | None, expected_trnm: str) -> None:
+        if frame is None:
+            raise KiwoomApiError("-1", f"invalid {expected_trnm} websocket response")
+        trnm = str(frame.get("trnm") or "")
+        if trnm != expected_trnm:
+            raise KiwoomApiError("-1", f"unexpected websocket response {trnm}, expected {expected_trnm}", frame)
+        if "return_code" in frame and str(frame.get("return_code")) not in {"0", ""}:
+            raise KiwoomApiError(str(frame.get("return_code")), str(frame.get("return_msg") or "websocket error"), frame)
+
+    def _parse_real_trade(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        values = item.get("values")
+        if not isinstance(values, dict):
+            return None
+        return {
+            "kind": "trade",
+            "symbol": _strip_code(item.get("item")),
+            "price": _parse_price(values.get("10")),
+            "change": _parse_dec(values.get("11")),
+            "change_rate": _parse_dec(values.get("12")),
+            "volume": int(_parse_num(values.get("13"))),
+            "trade_amount": int(_parse_num(values.get("14"))),
+            "exec_qty": int(_parse_num(values.get("15"))),
+            "open": _parse_price(values.get("16")),
+            "high": _parse_price(values.get("17")),
+            "low": _parse_price(values.get("18")),
+            "best_ask": _parse_price(values.get("27")),
+            "best_bid": _parse_price(values.get("28")),
+            "time": str(values.get("20") or ""),
+            "raw": item,
+        }
+
+    def _parse_real_orderbook(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        values = item.get("values")
+        if not isinstance(values, dict):
+            return None
+
+        asks: list[dict[str, Decimal | int]] = []
+        bids: list[dict[str, Decimal | int]] = []
+        for level in range(10):
+            ask_price = _parse_price(values.get(str(41 + level)))
+            ask_qty = int(_parse_num(values.get(str(61 + level))))
+            bid_price = _parse_price(values.get(str(51 + level)))
+            bid_qty = int(_parse_num(values.get(str(71 + level))))
+            if ask_price != 0 or ask_qty != 0:
+                asks.append({"price": ask_price, "qty": ask_qty})
+            if bid_price != 0 or bid_qty != 0:
+                bids.append({"price": bid_price, "qty": bid_qty})
+
+        asks.sort(key=lambda row: row["price"])
+        bids.sort(key=lambda row: row["price"], reverse=True)
+        return {
+            "kind": "orderbook",
+            "symbol": _strip_code(item.get("item")),
+            "asks": asks,
+            "bids": bids,
+            "best_ask": asks[0]["price"] if asks else Decimal("0"),
+            "best_bid": bids[0]["price"] if bids else Decimal("0"),
+            "time": str(values.get("21") or ""),
+            "raw": item,
+        }
+
+    def _parse_real(self, frame: dict[str, Any]) -> list[dict[str, Any]]:
+        parsed: list[dict[str, Any]] = []
+        data = frame.get("data")
+        if not isinstance(data, list):
+            return parsed
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            stream_type = str(item.get("type") or "")
+            if stream_type == "0B":
+                event = self._parse_real_trade(item)
+            elif stream_type == "0D":
+                event = self._parse_real_orderbook(item)
+            else:
+                event = None
+            if event is not None:
+                parsed.append(event)
+        return parsed
+
+    async def _ws_login_and_register(self, ws: Any, symbols: list[str]) -> None:
         await self._ensure_access_token()
         await ws.send(json.dumps({"trnm": "LOGIN", "token": self._access_token}, ensure_ascii=False))
-        for registration in registrations:
-            await ws.send(json.dumps({"trnm": "REG", **registration}, ensure_ascii=False))
+        login_frame = self._parse_ws_payload(await ws.recv())
+        self._check_ws_response(login_frame, "LOGIN")
 
-    async def stream_quotes(self, symbols: list[str]) -> AsyncIterator[dict[str, Any]]:
+        registration = {
+            "trnm": "REG",
+            "grp_no": "1",
+            "refresh": "1",
+            "data": [{"item": [_strip_code(symbol) for symbol in symbols], "type": ["0B", "0D"]}],
+        }
+        await ws.send(json.dumps(registration, ensure_ascii=False))
+        reg_frame = self._parse_ws_payload(await ws.recv())
+        self._check_ws_response(reg_frame, "REG")
+
+    async def _ws_connect_loop(self, symbols: list[str]) -> AsyncIterator[dict[str, Any]]:
         if websockets is None:
-            return
-        registrations = [
-            {
-                # TODO(openapi.kiwoom.com): confirm exact REG packet keys for 0D/0B real-time quote streams.
-                "grp_no": "1",
-                "refresh": "1",
-                "data": [{"item": symbol, "type": ["0D"]} for symbol in symbols],
-            }
-        ]
+            raise RuntimeError("websockets package is not available")
+
+        backoff_seconds = 1
         while True:
             try:
-                async with websockets.connect(self.websocket_url) as ws:  # type: ignore[union-attr]
-                    await self._ws_login_and_register(ws, registrations)
-                    async for raw in ws:
-                        payload = self._parse_ws_payload(raw)
-                        if payload is not None:
-                            yield payload
+                async with websockets.connect(self.websocket_url, ping_interval=None, max_size=None) as ws:  # type: ignore[union-attr]
+                    backoff_seconds = 1
+                    await self._ws_login_and_register(ws, symbols)
+                    while True:
+                        raw = await ws.recv()
+                        frame = self._parse_ws_payload(raw)
+                        if frame is None:
+                            continue
+                        trnm = str(frame.get("trnm") or "")
+                        if trnm == "PING":
+                            await ws.send(raw)
+                            continue
+                        if trnm == "REAL":
+                            for event in self._parse_real(frame):
+                                yield event
+                            continue
+                        if "return_code" in frame and str(frame.get("return_code")) not in {"0", ""}:
+                            raise KiwoomApiError(str(frame.get("return_code")), str(frame.get("return_msg") or "websocket error"), frame)
+            except KiwoomApiError:
+                raise
             except Exception:
-                await asyncio.sleep(1)
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, 30)
+
+    async def stream_quotes(self, symbols: list[str]) -> AsyncIterator[dict[str, Any]]:
+        async for event in self._ws_connect_loop(symbols):
+            yield event
 
     async def stream_market_ticks(self, symbols: list[str]) -> AsyncIterator[dict[str, Any]]:
         async for quote in self.stream_quotes(symbols):
-            yield quote
+            if quote.get("kind") == "trade":
+                yield quote
 
     async def stream_fills(self, account_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
         _ = account_id
-        if websockets is None:
-            return
-        registrations = [
-            {
-                # 0B=stock fills, 04=balance.
-                # TODO(openapi.kiwoom.com): confirm exact REG packet keys for fill/balance subscriptions.
-                "grp_no": "1",
-                "refresh": "1",
-                "data": [{"item": self.account_no, "type": ["0B", "04"]}],
-            }
-        ]
-        while True:
-            try:
-                async with websockets.connect(self.websocket_url) as ws:  # type: ignore[union-attr]
-                    await self._ws_login_and_register(ws, registrations)
-                    async for raw in ws:
-                        payload = self._parse_ws_payload(raw)
-                        if payload is not None:
-                            yield payload
-            except Exception:
-                await asyncio.sleep(1)
+        # TODO(openapi.kiwoom.com): implement order/fill notification streams after
+        # measuring Kiwoom account execution types "00"/"04". Do not use stock
+        # trade type "0B" here; it is market trade print data, not account fills.
+        raise NotImplementedError("Kiwoom account fill websocket types 00/04 are not measured yet")
+        yield {}
 
 
 BrokerAdapter = KiwoomRestKrBaseAdapter

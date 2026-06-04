@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import brokers.kiwoom_rest_kr_base as kiwoom_base
 from brokers.kiwoom_rest_kr_base import _parse_dec, _parse_num, _parse_price, _strip_code
 from brokers.kiwoom_rest_kr_mock import KiwoomApiError, KiwoomRestKrMockAdapter
 from core.models.order import OrderRequest
@@ -28,6 +29,26 @@ def _token_payload() -> dict:
         "return_code": 0,
         "return_msg": "OK",
     }
+
+
+class _FakeWebSocket:
+    def __init__(self, frames: list[dict]) -> None:
+        self._frames = [json.dumps(frame, ensure_ascii=False) for frame in frames]
+        self.sent: list[str] = []
+
+    async def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    async def recv(self) -> str:
+        if not self._frames:
+            raise RuntimeError("no more websocket frames")
+        return self._frames.pop(0)
+
+    async def __aenter__(self) -> "_FakeWebSocket":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
 
 
 def test_kiwoom_numeric_and_code_helpers_parse_measured_shapes() -> None:
@@ -373,3 +394,109 @@ async def test_get_orderbook_uses_ka10004_mrkcond_and_parses_ladder() -> None:
     assert orderbook["total_bid_qty"] == 382440
     assert orderbook["ts"] == "134710"
     assert orderbook["raw"] == _fixture("kiwoom_orderbook_ka10004.json")
+
+
+def test_websocket_url_derives_from_base_url_and_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KIWOOM_WS_URL", raising=False)
+    monkeypatch.delenv("KIWOOM_WEBSOCKET_URL", raising=False)
+
+    adapter = KiwoomRestKrMockAdapter(
+        app_key="app",
+        app_secret="sec",
+        account_no="000",
+        base_url="https://mockapi.kiwoom.com",
+    )
+    assert adapter.websocket_url == "wss://mockapi.kiwoom.com:10000/api/dostk/websocket"
+
+    monkeypatch.setenv("KIWOOM_WS_URL", "wss://example.test/custom")
+    overridden = KiwoomRestKrMockAdapter(
+        app_key="app",
+        app_secret="sec",
+        account_no="000",
+        base_url="https://mockapi.kiwoom.com",
+    )
+    assert overridden.websocket_url == "wss://example.test/custom"
+
+
+@pytest.mark.asyncio
+async def test_stream_quotes_logs_in_registers_echoes_ping_and_parses_real_frames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    login_response = {"trnm": "LOGIN", "return_code": 0, "return_msg": "", "sor_yn": "Y"}
+    reg_response = {"trnm": "REG", "return_code": 0, "return_msg": ""}
+    ping_frame = {"trnm": "PING"}
+    fake_ws = _FakeWebSocket(
+        [
+            login_response,
+            reg_response,
+            ping_frame,
+            _fixture("kiwoom_ws_real_0b.json"),
+            _fixture("kiwoom_ws_real_0d.json"),
+        ]
+    )
+    connect_calls: list[tuple[str, dict]] = []
+
+    def fake_connect(url: str, **kwargs) -> _FakeWebSocket:
+        connect_calls.append((url, kwargs))
+        return fake_ws
+
+    monkeypatch.setattr(kiwoom_base.websockets, "connect", fake_connect)
+    adapter = KiwoomRestKrMockAdapter(
+        app_key="app",
+        app_secret="sec",
+        account_no="000",
+        base_url="https://mockapi.kiwoom.com",
+    )
+    adapter._access_token = "TOKEN-1"
+    adapter._access_token_expires_at = datetime(2099, 1, 1, tzinfo=timezone.utc)
+
+    stream = adapter.stream_quotes(["A005930"])
+    trade = await anext(stream)
+    orderbook = await anext(stream)
+    await stream.aclose()
+
+    assert connect_calls == [
+        (
+            "wss://mockapi.kiwoom.com:10000/api/dostk/websocket",
+            {"ping_interval": None, "max_size": None},
+        )
+    ]
+    assert json.loads(fake_ws.sent[0]) == {"trnm": "LOGIN", "token": "TOKEN-1"}
+    assert json.loads(fake_ws.sent[1]) == {
+        "trnm": "REG",
+        "grp_no": "1",
+        "refresh": "1",
+        "data": [{"item": ["005930"], "type": ["0B", "0D"]}],
+    }
+    assert fake_ws.sent[2] == json.dumps(ping_frame, ensure_ascii=False)
+
+    assert trade["kind"] == "trade"
+    assert trade["symbol"] == "005930"
+    assert trade["price"] == Decimal("356500")
+    assert trade["change"] == Decimal("-4000")
+    assert trade["change_rate"] == Decimal("-1.11")
+    assert trade["volume"] == 26484391
+    assert trade["exec_qty"] == -116
+    assert trade["open"] == Decimal("349000")
+    assert trade["high"] == Decimal("366000")
+    assert trade["low"] == Decimal("348000")
+    assert trade["best_ask"] == Decimal("357000")
+    assert trade["best_bid"] == Decimal("356500")
+    assert trade["time"] == "141307"
+
+    assert orderbook["kind"] == "orderbook"
+    assert orderbook["symbol"] == "005930"
+    assert orderbook["asks"][0] == {"price": Decimal("357000"), "qty": 32401}
+    assert orderbook["bids"][0] == {"price": Decimal("356500"), "qty": 27904}
+    assert orderbook["best_ask"] == Decimal("357000")
+    assert orderbook["best_bid"] == Decimal("356500")
+    assert orderbook["time"] == "141307"
+
+
+@pytest.mark.asyncio
+async def test_stream_fills_is_not_implemented_until_account_ws_types_are_measured() -> None:
+    adapter = KiwoomRestKrMockAdapter(app_key="app", app_secret="sec", account_no="000")
+    stream = adapter.stream_fills()
+
+    with pytest.raises(NotImplementedError):
+        await anext(stream)
