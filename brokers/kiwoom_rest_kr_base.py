@@ -100,6 +100,15 @@ def _parse_num(value: Any) -> int | Decimal:
     return int(number)
 
 
+def _parse_price(value: Any) -> Decimal:
+    """Parse Kiwoom quote prices where +/- is direction, not signed value."""
+
+    text = str(value or "").strip()
+    if text in {"", "0", "-0", "+0"}:
+        return Decimal("0")
+    return Decimal(text.lstrip("+-").lstrip("0") or "0")
+
+
 def _strip_code(value: Any) -> str:
     """Normalize Kiwoom stock codes such as A005930 -> 005930."""
 
@@ -393,37 +402,76 @@ class KiwoomRestKrBaseAdapter:
         return Account(account_id=account_id, cash_balance=cash.cash_balance, positions=positions)
 
     async def get_quote(self, symbol: str | Symbol) -> dict[str, Any]:
-        code = str(symbol)
+        code = _strip_code(symbol)
         payload = await self._post_api("/api/dostk/stkinfo", "ka10001", {"stk_cd": code})
         body = payload.get("output") if isinstance(payload.get("output"), dict) else payload
-        # TODO(openapi.kiwoom.com): verify exact response keys for ka10001 across mock/live.
         return {
-            "symbol": code,
+            "symbol": _strip_code(_first(body, "stk_cd", default=code)),
+            "name": str(_first(body, "stk_nm", default="")),
             "market": "KR",
-            "price": _to_decimal(_first(body, "cur_prc", "stck_prpr", "price", "현재가", default="0")),
-            "bid": _to_decimal(_first(body, "bid_prc", "bid", default="0")),
-            "ask": _to_decimal(_first(body, "ask_prc", "ask", default="0")),
-            "volume": _to_decimal(_first(body, "trde_qty", "acml_vol", "volume", "거래량", default="0")),
+            "price": _parse_price(_first(body, "cur_prc", default="0")),
+            "prev_close": _parse_price(_first(body, "base_pric", default="0")),
+            "open": _parse_price(_first(body, "open_pric", default="0")),
+            "high": _parse_price(_first(body, "high_pric", default="0")),
+            "low": _parse_price(_first(body, "low_pric", default="0")),
+            "upper_limit": _parse_price(_first(body, "upl_pric", default="0")),
+            "lower_limit": _parse_price(_first(body, "lst_pric", default="0")),
+            "change": _parse_dec(_first(body, "pred_pre", default="0")),
+            "change_rate": _parse_dec(_first(body, "flu_rt", default="0")),
+            "volume": int(_parse_num(_first(body, "trde_qty", default="0"))),
             "is_halted": str(_first(body, "trde_stop_yn", "is_halted", default="N")).upper() in {"Y", "TRUE", "1"},
             "occurred_at": self._now().isoformat(),
-            "raw": body,
+            "raw": payload,
         }
 
     async def get_market_tick(self, symbol: str | Symbol) -> dict[str, Any]:
         return await self.get_quote(symbol)
 
     async def get_orderbook(self, symbol: str | Symbol) -> dict[str, Any]:
-        code = str(symbol)
-        payload = await self._post_api("/api/dostk/stkinfo", "ka10004", {"stk_cd": code})
+        code = _strip_code(symbol)
+        payload = await self._post_api("/api/dostk/mrkcond", "ka10004", {"stk_cd": code})
         body = payload.get("output") if isinstance(payload.get("output"), dict) else payload
-        # TODO(openapi.kiwoom.com): verify exact bid/ask ladder field names for ka10004.
+        asks: list[dict[str, Decimal | int]] = []
+        bids: list[dict[str, Decimal | int]] = []
+        for level in range(1, 11):
+            if level == 1:
+                ask_price_key = "sel_fpr_bid"
+                ask_qty_key = "sel_fpr_req"
+                bid_price_key = "buy_fpr_bid"
+                bid_qty_key = "buy_fpr_req"
+            else:
+                ask_price_key = f"sel_{level}th_pre_bid"
+                ask_qty_key = f"sel_{level}th_pre_req"
+                bid_price_key = f"buy_{level}th_pre_bid"
+                bid_qty_key = f"buy_{level}th_pre_req"
+
+            asks.append(
+                {
+                    "price": _parse_price(_first(body, ask_price_key, default="0")),
+                    "quantity": int(_parse_num(_first(body, ask_qty_key, default="0"))),
+                }
+            )
+            bids.append(
+                {
+                    "price": _parse_price(_first(body, bid_price_key, default="0")),
+                    "quantity": int(_parse_num(_first(body, bid_qty_key, default="0"))),
+                }
+            )
+
+        asks.sort(key=lambda item: item["price"])
+        bids.sort(key=lambda item: item["price"], reverse=True)
         return {
             "symbol": code,
-            "bid": _to_decimal(_first(body, "bid_prc", "bidp1", "매수호가1", "bid", default="0")),
-            "ask": _to_decimal(_first(body, "ask_prc", "askp1", "매도호가1", "ask", default="0")),
-            "bid_quantity": _to_decimal(_first(body, "bid_qty", "bidp_rsqn1", "매수잔량1", default="0")),
-            "ask_quantity": _to_decimal(_first(body, "ask_qty", "askp_rsqn1", "매도잔량1", default="0")),
-            "raw": body,
+            "asks": asks,
+            "bids": bids,
+            "best_ask": asks[0] if asks else None,
+            "best_bid": bids[0] if bids else None,
+            "ask": asks[0]["price"] if asks else Decimal("0"),
+            "bid": bids[0]["price"] if bids else Decimal("0"),
+            "total_ask_qty": int(_parse_num(_first(body, "tot_sel_req", default="0"))),
+            "total_bid_qty": int(_parse_num(_first(body, "tot_buy_req", default="0"))),
+            "ts": str(_first(body, "bid_req_base_tm", default="")),
+            "raw": payload,
         }
 
     async def submit_order(self, request: OrderRequest) -> OrderAck:

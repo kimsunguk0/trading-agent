@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from brokers.kiwoom_rest_kr_base import _parse_dec, _parse_num, _strip_code
+from brokers.kiwoom_rest_kr_base import _parse_dec, _parse_num, _parse_price, _strip_code
 from brokers.kiwoom_rest_kr_mock import KiwoomApiError, KiwoomRestKrMockAdapter
 from core.models.order import OrderRequest
 
@@ -37,6 +37,15 @@ def test_kiwoom_numeric_and_code_helpers_parse_measured_shapes() -> None:
     assert _parse_dec("000000100.00") == Decimal("100.00")
     assert _strip_code("A005930") == "005930"
     assert _strip_code("KR005930") == "005930"
+
+
+def test_kiwoom_parse_price_treats_direction_sign_as_absolute_value() -> None:
+    assert _parse_price("-357500") == Decimal("357500")
+    assert _parse_price("+366000") == Decimal("366000")
+    assert _parse_price("-0") == Decimal("0")
+    assert _parse_price("") == Decimal("0")
+    assert _parse_price("360500") == Decimal("360500")
+    assert _parse_price("0") == Decimal("0")
 
 
 @pytest.mark.asyncio
@@ -285,3 +294,82 @@ async def test_cash_and_positions_use_kiwoom_account_api_ids() -> None:
         "total_profit_rate": Decimal("-0.16"),
         "estimated_deposit_asset_amount": Decimal("12036750"),
     }
+
+
+@pytest.mark.asyncio
+async def test_get_quote_uses_ka10001_and_parses_measured_price_fields() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(200, json=_token_payload())
+        return httpx.Response(200, json=_fixture("kiwoom_quote_ka10001.json"))
+
+    adapter = KiwoomRestKrMockAdapter(
+        app_key="app",
+        app_secret="sec",
+        account_no="000",
+        transport=httpx.MockTransport(handler),
+    )
+
+    quote = await adapter.get_quote("005930")
+
+    quote_request = [request for request in requests if request.url.path != "/oauth2/token"][-1]
+    assert quote_request.method == "POST"
+    assert str(quote_request.url) == "https://mockapi.kiwoom.com/api/dostk/stkinfo"
+    assert quote_request.headers["authorization"] == "Bearer TOKEN-1"
+    assert quote_request.headers["api-id"] == "ka10001"
+    assert json.loads(quote_request.content) == {"stk_cd": "005930"}
+
+    assert quote["symbol"] == "005930"
+    assert quote["name"] == "삼성전자"
+    assert quote["price"] == Decimal("357500")
+    assert quote["prev_close"] == Decimal("360500")
+    assert quote["open"] == Decimal("349000")
+    assert quote["high"] == Decimal("366000")
+    assert quote["low"] == Decimal("348000")
+    assert quote["upper_limit"] == Decimal("468500")
+    assert quote["lower_limit"] == Decimal("252500")
+    assert quote["change"] == Decimal("-3000")
+    assert quote["change_rate"] == Decimal("-0.83")
+    assert quote["volume"] == 25387787
+    assert quote["raw"] == _fixture("kiwoom_quote_ka10001.json")
+
+
+@pytest.mark.asyncio
+async def test_get_orderbook_uses_ka10004_mrkcond_and_parses_ladder() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(200, json=_token_payload())
+        return httpx.Response(200, json=_fixture("kiwoom_orderbook_ka10004.json"))
+
+    adapter = KiwoomRestKrMockAdapter(
+        app_key="app",
+        app_secret="sec",
+        account_no="000",
+        transport=httpx.MockTransport(handler),
+    )
+
+    orderbook = await adapter.get_orderbook("005930")
+
+    orderbook_request = [request for request in requests if request.url.path != "/oauth2/token"][-1]
+    assert orderbook_request.method == "POST"
+    assert str(orderbook_request.url) == "https://mockapi.kiwoom.com/api/dostk/mrkcond"
+    assert orderbook_request.headers["authorization"] == "Bearer TOKEN-1"
+    assert orderbook_request.headers["api-id"] == "ka10004"
+    assert json.loads(orderbook_request.content) == {"stk_cd": "005930"}
+
+    assert orderbook["best_ask"] == {"price": Decimal("358000"), "quantity": 18344}
+    assert orderbook["best_bid"] == {"price": Decimal("357500"), "quantity": 30793}
+    assert len(orderbook["asks"]) == 10
+    assert len(orderbook["bids"]) == 10
+    assert orderbook["asks"][0]["price"] < orderbook["asks"][1]["price"]
+    assert orderbook["bids"][0]["price"] > orderbook["bids"][1]["price"]
+    assert orderbook["total_ask_qty"] == 419387
+    assert orderbook["total_bid_qty"] == 382440
+    assert orderbook["ts"] == "134710"
+    assert orderbook["raw"] == _fixture("kiwoom_orderbook_ka10004.json")

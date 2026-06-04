@@ -11,6 +11,7 @@ from brokers.kiwoom_rest_kr_base import (
     KiwoomApiError,
     KiwoomRestKrBaseAdapter,
     _AsyncRateLimiter,
+    _parse_price,
 )
 
 
@@ -43,4 +44,4 @@ class KiwoomRestKrLiveAdapter(KiwoomRestKrBaseAdapter):
 
 BrokerAdapter = KiwoomRestKrLiveAdapter
 
-__all__ = ["KiwoomRestKrLiveAdapter", "KiwoomApiError", "_AsyncRateLimiter"]
+__all__ = ["KiwoomRestKrLiveAdapter", "KiwoomApiError", "_AsyncRateLimiter", "_parse_price"]

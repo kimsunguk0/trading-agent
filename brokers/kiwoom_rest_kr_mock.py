@@ -9,6 +9,7 @@ from brokers.kiwoom_rest_kr_base import (
     KiwoomApiError,
     KiwoomRestKrBaseAdapter,
     _AsyncRateLimiter,
+    _parse_price,
 )
 
 
@@ -21,4 +22,4 @@ class KiwoomRestKrMockAdapter(KiwoomRestKrBaseAdapter):
 
 BrokerAdapter = KiwoomRestKrMockAdapter
 
-__all__ = ["KiwoomRestKrMockAdapter", "KiwoomApiError", "_AsyncRateLimiter"]
+__all__ = ["KiwoomRestKrMockAdapter", "KiwoomApiError", "_AsyncRateLimiter", "_parse_price"]
