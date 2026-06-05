@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from collections import defaultdict, deque
 from decimal import Decimal
 from types import SimpleNamespace
@@ -182,3 +184,86 @@ async def test_disable_market_blocks_shared_entry_control() -> None:
 
     assert allowed is False
     assert "market:US blocked" in reason
+
+
+@pytest.mark.asyncio
+async def test_candidate_listener_raw_stream_skips_unknown_and_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[tuple[int, str, str | None]] = []
+
+    candidate = {
+        "event_type": "news_candidate",
+        "code": "005930",
+        "symbol_name": "삼성전자",
+        "strategy_id": "kr_news_breakout_v1",
+        "confidence": "0.81",
+        "regime": "bull_trend",
+        "news_summary": "실적 전망 상향",
+        "technical_summary": "장중 고점 돌파",
+        "risk": {
+            "position_pct": "1.7",
+            "spread_pct": "0.08",
+            "stop_loss_pct": "2.5",
+            "time_stop_minutes": "45",
+            "take_profit": [{"pct": "4.0"}, {"pct": "8.0"}],
+        },
+        "price": "78500",
+        "quantity": "12",
+        "order_intent_id": "OI-TEST-1",
+    }
+    enveloped_candidate = {
+        "event_type": "signal",
+        "strategy_id": "kr_news_breakout_v1",
+        "account_id": "default",
+        "symbol": "005930",
+        "side": "BUY",
+        "signal_score": "0.82",
+        "payload": {**candidate, "code": "000660", "symbol_name": "SK하이닉스", "order_intent_id": "OI-TEST-2"},
+    }
+
+    class _FakeRedis:
+        closed = False
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def xread(self, *_args: object, **_kwargs: object) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
+            self.calls += 1
+            if self.calls > 1:
+                raise asyncio.CancelledError()
+            return [
+                (
+                    "paper.events.signal",
+                    [
+                        ("1-0", {"payload": "{not-json"}),
+                        ("2-0", {"payload": json.dumps({"event_type": "news_analysis", "payload": {"code": "005930"}})}),
+                        ("3-0", {"payload": json.dumps(candidate, ensure_ascii=False)}),
+                        ("4-0", {"payload": json.dumps(enveloped_candidate, ensure_ascii=False)}),
+                    ],
+                )
+            ]
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class _FakeBot:
+        def __init__(self, token: str | None = None) -> None:
+            self.token = token
+
+        async def send_message(self, chat_id: int, text: str) -> None:
+            sent.append((chat_id, text, self.token))
+
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr(bot, "_redis_client", lambda: fake_redis)
+    monkeypatch.setattr(bot, "Bot", _FakeBot)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+
+    with pytest.raises(asyncio.CancelledError):
+        await bot._candidate_listener()
+
+    assert fake_redis.closed is True
+    assert len(sent) == 2
+    assert sent[0][0] == 123
+    assert sent[0][2] == "test-token"
+    assert "[매수 후보] KR 005930 삼성전자" in sent[0][1]
+    assert "[매수 후보] KR 000660 SK하이닉스" in sent[1][1]
+    assert all("news_analysis" not in text for _chat_id, text, _token in sent)

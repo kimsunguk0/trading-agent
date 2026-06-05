@@ -74,7 +74,6 @@ except Exception:  # pragma: no cover - package-less local smoke imports
     class ContextTypes:  # type: ignore[no-redef]
         DEFAULT_TYPE = object
 
-from core.events.bus import RedisStreamBus
 from core.events.schemas import EventType
 from core.operating_mode import (
     OperatingMode,
@@ -660,6 +659,44 @@ def _redis_entries(rows: Iterable[Any]) -> Iterable[tuple[Any, dict[str, Any]]]:
                     yield nested[0], nested[1]
 
 
+def _parse_signal_stream_payload(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        logger.warning("Skipping signal stream message without string payload")
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        logger.warning("Skipping malformed signal stream payload: %s", exc)
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("Skipping non-object signal stream payload")
+        return None
+    return payload
+
+
+def _candidate_payload_from_signal_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    event_type = str(message.get("event_type", ""))
+    if event_type == "news_candidate":
+        return message
+    if event_type == EventType.SIGNAL.value:
+        payload = message.get("payload")
+        if isinstance(payload, dict) and payload.get("event_type") == "news_candidate":
+            return payload
+    return None
+
+
+async def _send_candidate_notifications(payload: dict[str, Any], user_ids: list[int], token: str | None) -> None:
+    text = _format_candidate(payload)
+    bot = Bot(token=token)
+    for user_id in user_ids:
+        try:
+            await bot.send_message(chat_id=user_id, text=text)
+        except Exception as exc:
+            logger.warning("Failed to send candidate notification to %s: %s", user_id, exc)
+
+
 async def _fetch_candidate_payloads(symbol: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
     client = _redis_client()
     if client is None:
@@ -671,11 +708,8 @@ async def _fetch_candidate_payloads(symbol: str | None = None, limit: int = 20) 
         rows = await client.xrevrange(stream, count=300)
         for _message_id, fields in _redis_entries(rows):
             raw = fields.get("payload") if isinstance(fields, dict) else None
-            if not isinstance(raw, str):
-                continue
-            try:
-                payload = json.loads(raw)
-            except Exception:
+            payload = _parse_signal_stream_payload(raw)
+            if payload is None:
                 continue
             if payload.get("event_type") != "news_candidate":
                 continue
@@ -1414,20 +1448,39 @@ async def _candidate_listener() -> None:
     if not user_ids:
         return
 
-    bus = RedisStreamBus(redis_url=_redis_url(), stream_prefix=_stream_prefix())
+    client = _redis_client()
+    if client is None:
+        logger.warning("Redis unavailable; Telegram candidate listener is disabled.")
+        return
 
-    async for event in bus.subscribe(EventType.SIGNAL):
-        payload = event.payload if isinstance(event, object) else {}
-        if not isinstance(payload, dict):
-            continue
-        if payload.get("event_type") != "news_candidate":
-            continue
-        text = _format_candidate(payload)
-        for user_id in user_ids:
+    # Keep typed RedisStreamBus consumers strict. The signals stream intentionally
+    # carries news_candidate/news_analysis envelopes that are not core EventType
+    # values, so Telegram reads raw JSON and filters only candidate notifications.
+    stream = f"{_stream_prefix()}.{EventType.SIGNAL.value}"
+    cursor = "0-0"
+    try:
+        while True:
             try:
-                await Bot(token=os.getenv("TELEGRAM_BOT_TOKEN")).send_message(chat_id=user_id, text=text)
-            except Exception:
+                rows = await client.xread({stream: cursor}, count=10, block=1000)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Failed to read Telegram candidate stream: %s", exc)
+                await asyncio.sleep(1)
                 continue
+
+            for message_id, fields in _redis_entries(rows):
+                cursor = str(message_id)
+                raw = fields.get("payload") if isinstance(fields, dict) else None
+                message = _parse_signal_stream_payload(raw)
+                if message is None:
+                    continue
+                payload = _candidate_payload_from_signal_message(message)
+                if payload is None:
+                    continue
+                await _send_candidate_notifications(payload, user_ids, os.getenv("TELEGRAM_BOT_TOKEN"))
+    finally:
+        await _close_client(client)
 
 
 async def _runner() -> None:
