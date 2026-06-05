@@ -1,0 +1,6 @@
+# 개발용: 기존 stock-bot-telegram 이미지에 현재 소스를 마운트해 재빌드 없이 최신 코드 구동
+services:
+  bot-telegram:
+    image: stock-bot-telegram:latest
+    volumes:
+      - ./:/app

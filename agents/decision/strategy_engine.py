@@ -716,7 +716,7 @@ class StrategyEngine:
                 "strategy_id": cfg.strategy_id,
                 "strategy_version": cfg.version,
                 "price": str(_to_decimal(tick.price)),
-                "quantity": "1",
+                "quantity": str(cfg.quantity),
                 "news_summary": news_summary,
                 "technical_summary": technical_summary,
                 "rag_context": rag_context or {},
@@ -739,6 +739,9 @@ class StrategyEngine:
                 "news_time": news_ctx.get("news_time"),
                 "source": news_ctx.get("source", ""),
                 "symbol_name": str(news_ctx.get("symbol_name", "")),
+                "order_type": cfg.execution.order_type,
+                "limit_price_basis": cfg.execution.limit_price_basis,
+                "allow_market_order": bool(cfg.execution.allow_market_order),
                 "execution": {
                     "order_type": cfg.execution.order_type,
                     "limit_price_basis": cfg.execution.limit_price_basis,
@@ -763,6 +766,7 @@ class StrategyEngine:
                 "regime": self._current_regime,
                 "strategy_id": cfg.strategy_id,
                 "order_type": cfg.order_type,
+                "quantity": str(cfg.quantity),
             },
         )
 

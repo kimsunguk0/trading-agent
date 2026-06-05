@@ -24,6 +24,12 @@ class EventType(str, Enum):
     CORPORATE_ACTION = "corporate_action"
 
 
+# Canonical stream suffix for executable order intents.
+# The event_type remains singular "order_intent", but execution workers consume
+# the plural Redis stream suffix: {REDIS_STREAM_PREFIX}.order_intents.
+ORDER_INTENTS_STREAM = "order_intents"
+
+
 class Event(BaseModel):
     event_id: str = Field(default_factory=lambda: str(uuid4()))
     event_type: EventType

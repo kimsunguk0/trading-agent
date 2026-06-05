@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Callable
+from typing import Any, Callable
 
-from core.events.schemas import RiskEvent
+from brokers.base import BrokerAdapter
 from core.execution.idempotency import OrderIdempotencyManager
 from core.execution.state_machine import (
     OrderExecutionEvent,
@@ -16,10 +16,12 @@ from core.execution.state_machine import (
     OrderStateMachine,
 )
 from core.models.order import OrderAck, OrderRequest, OrderStatus, RiskCheckResult
+from core.models.portfolio import Account, CashSnapshot
 from core.risk.gate import RiskGate
 from core.system_state import SystemStateMachine
-from core.models.portfolio import Account
-from brokers.base import BrokerAdapter
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,7 +41,7 @@ class ExecutionEngine:
         idempotency: OrderIdempotencyManager,
         risk_gate: RiskGate,
         system_state: SystemStateMachine,
-        account_lookup: Callable[[str], Account | None],
+        account_lookup: Callable[[str], Account | CashSnapshot | None],
         broker_timeout_seconds: float = 1.5,
         unknown_poll_attempts: int = 3,
     ) -> None:
@@ -51,6 +53,26 @@ class ExecutionEngine:
         self.account_lookup = account_lookup
         self.broker_timeout_seconds = broker_timeout_seconds
         self.unknown_poll_attempts = unknown_poll_attempts
+
+    async def _maybe_await(self, value: Any) -> Any:
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    async def _lookup_account(self, account_id: str) -> Account | CashSnapshot | None:
+        return await self._maybe_await(self.account_lookup(account_id))
+
+    async def _submit_broker_order(self, request: OrderRequest) -> OrderAck | None:
+        submit = getattr(self.broker, "submit_order", None)
+        if not callable(submit):
+            submit = getattr(self.broker, "place_order", None)
+        if not callable(submit):
+            raise AttributeError("broker must implement submit_order or place_order")
+        return await self._maybe_await(submit(request))
+
+    async def _get_broker_order_status(self, order_intent_id: str) -> OrderAck | None:
+        get_status = getattr(self.broker, "get_order_status")
+        return await self._maybe_await(get_status(order_intent_id))
 
     async def submit_order_intent(self, request: OrderRequest) -> ExecutionResult:
         if self.system_state.is_halted:
@@ -77,7 +99,7 @@ class ExecutionEngine:
             )
 
         state = self.state_machine.next(None, OrderExecutionEvent.SIGNAL_CREATED)
-        account = self.account_lookup(request.account_id)
+        account = await self._lookup_account(request.account_id)
         risk = await self.risk_gate.evaluate(request, account)
         if not risk.passed:
             await self.idempotency.mark_finalized_async(request, "RISK_REJECTED")
@@ -94,7 +116,7 @@ class ExecutionEngine:
 
         try:
             ack = await asyncio.wait_for(
-                self.broker.submit_order(request),
+                self._submit_broker_order(request),
                 timeout=self.broker_timeout_seconds,
             )
         except asyncio.TimeoutError:
@@ -113,6 +135,19 @@ class ExecutionEngine:
                 risk,
                 None,
                 "unknown_submitted",
+            )
+        except Exception as exc:
+            await self.idempotency.mark_finalized_async(request, "BROKER_ERROR")
+            logger.exception(
+                "Broker order submission failed.",
+                extra={"order_intent_id": request.order_intent_id, "broker": type(self.broker).__name__},
+            )
+            return ExecutionResult(
+                request.order_intent_id,
+                OrderExecutionState.FAILED,
+                risk,
+                None,
+                f"broker_error:{type(exc).__name__}",
             )
 
         if ack is None:
@@ -139,7 +174,7 @@ class ExecutionEngine:
     async def _poll_unknown_status(self, order_intent_id: str) -> OrderAck | None:
         delay = 0.25
         for attempt in range(self.unknown_poll_attempts):
-            status = await self.broker.get_order_status(order_intent_id)
+            status = await self._get_broker_order_status(order_intent_id)
             if status is not None:
                 return status
             await asyncio.sleep(delay)

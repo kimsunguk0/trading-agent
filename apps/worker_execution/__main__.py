@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import inspect
+import json
 import logging
 import os
 from dataclasses import dataclass
+from typing import Any, AsyncIterator
 
 from core.execution.engine import ExecutionEngine
 from core.events.bus import RedisStreamBus
+from core.events.schemas import ORDER_INTENTS_STREAM
 from core.execution.idempotency import OrderIdempotencyManager
 from core.execution.state_machine import OrderStateMachine
 from core.models.order import OrderRequest
@@ -91,16 +95,147 @@ def _select_broker() -> tuple[object, bool]:
     return adapter, bool(getattr(adapter.capabilities, "supports_client_order_id", False))
 
 
-def _extract_order_request(payload: dict) -> OrderRequest:
-    if isinstance(payload.get("request"), dict):
-        return OrderRequest(**payload["request"])
-    return OrderRequest(**payload)
+def _safe_for_log(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return value
 
 
-def _account_lookup(adapter: object, account_id: str):
-    if hasattr(adapter, "get_account"):
-        return adapter.get_account(account_id)  # type: ignore[no-any-return]
+def _try_order_request(candidate: Any) -> OrderRequest | None:
+    if isinstance(candidate, OrderRequest):
+        return candidate
+    if not isinstance(candidate, dict) or not candidate:
+        return None
+    try:
+        return OrderRequest(**candidate)
+    except Exception:
+        return None
+
+
+def _extract_order_request(event_or_payload: Any) -> OrderRequest | None:
+    """Extract OrderRequest from current request-shaped or legacy payload events."""
+
+    candidates: list[Any] = []
+    if isinstance(event_or_payload, dict):
+        candidates.append(event_or_payload.get("request"))
+        payload = event_or_payload.get("payload")
+        if isinstance(payload, dict):
+            candidates.append(payload.get("request"))
+            candidates.append(payload)
+        candidates.append(event_or_payload)
+    else:
+        candidates.append(getattr(event_or_payload, "request", None))
+        payload = getattr(event_or_payload, "payload", None)
+        if isinstance(payload, dict):
+            candidates.append(payload.get("request"))
+            candidates.append(payload)
+
+    for candidate in candidates:
+        request = _try_order_request(candidate)
+        if request is not None:
+            return request
+
+    logger.warning(
+        "Skipping order_intent event without a valid order request.",
+        extra={"order_intent_event": _safe_for_log(event_or_payload)},
+    )
     return None
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _account_lookup(adapter: object, account_id: str):
+    for method_name in ("get_account", "get_cash", "get_cash_snapshot"):
+        accessor = getattr(adapter, method_name, None)
+        if not callable(accessor):
+            continue
+        account = await _maybe_await(accessor(account_id))
+        if account is not None:
+            return account
+    return None
+
+
+async def _process_order_intent_event(event: Any, engine: ExecutionEngine, mapping_store: IdempotencyMappingStore) -> bool:
+    try:
+        request = _extract_order_request(event)
+        if request is None:
+            return False
+
+        result = await engine.submit_order_intent(request)
+
+        if not mapping_store.supports_client_order_id and result.ack is not None:
+            mapping_store.upsert(request.order_intent_id, result.ack.order_id)
+        return True
+    except Exception:
+        logger.exception(
+            "Skipping order_intent event after processing error.",
+            extra={"order_intent_event": _safe_for_log(event)},
+        )
+        return False
+
+
+def _decode_order_intent_body(bus: RedisStreamBus, body: str | None) -> Any | None:
+    if body is None:
+        return None
+    try:
+        return bus._decode(body)
+    except Exception:
+        try:
+            payload = json.loads(body)
+        except Exception:
+            logger.warning(
+                "Skipping undecodable order_intent stream message.",
+                extra={"order_intent_stream_body": body},
+                exc_info=True,
+            )
+            return None
+
+        if isinstance(payload, dict):
+            return payload
+
+        logger.warning(
+            "Skipping non-object order_intent stream message.",
+            extra={"order_intent_stream_body": body},
+        )
+        return None
+
+
+async def _subscribe_order_intent_events(bus: RedisStreamBus) -> AsyncIterator[Any]:
+    """Read canonical order-intent stream while isolating bad messages."""
+
+    stream = bus.stream_name(ORDER_INTENTS_STREAM)
+    if bus._client is None:
+        import asyncio
+
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        bus._fallback_subscribers[stream].append(queue)
+        try:
+            while True:
+                body = await queue.get()
+                event = _decode_order_intent_body(bus, body)
+                if event is not None:
+                    yield event
+        finally:
+            bus._fallback_subscribers[stream] = [
+                q for q in bus._fallback_subscribers[stream] if q is not queue
+            ]
+        return
+
+    cursor = "0-0"
+    while True:
+        messages = await bus._client.xread({stream: cursor}, count=10, block=1000)
+        if not messages:
+            continue
+        for _, entries in messages:
+            for message_id, payloads in entries:
+                cursor = message_id
+                event = _decode_order_intent_body(bus, payloads.get("payload"))
+                if event is not None:
+                    yield event
 
 
 async def main() -> None:
@@ -131,15 +266,11 @@ async def main() -> None:
         mapping={},
     )
 
-    async for event in bus.subscribe("order_intents"):
-        request = _extract_order_request(event.payload)
-        result = await engine.submit_order_intent(request)
-
-        if not mapping_store.supports_client_order_id and result.ack is not None:
-            mapping_store.upsert(request.order_intent_id, result.ack.order_id)
-
-        # Keep mapping even when supports client id is unavailable in broker schema.
-        # In this MVP stage, this is used as an in-memory operational backreference.
+    # Canonical executable order-intent stream:
+    # {REDIS_STREAM_PREFIX}.order_intents. The payload event_type remains
+    # singular "order_intent" for schema compatibility.
+    async for event in _subscribe_order_intent_events(bus):
+        await _process_order_intent_event(event, engine, mapping_store)
 
 
 if __name__ == "__main__":

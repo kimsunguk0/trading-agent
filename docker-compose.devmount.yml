@@ -1,0 +1,30 @@
+# 개발용: 재빌드 없이 현재 소스를 모든 앱 서비스에 마운트해 최신 코드 구동.
+# env_file로 .env.paper 전체를 컨테이너에 주입(KIWOOM_* 키 등).
+# worker-agent/worker-strategy는 전용 이미지가 없어 deps 동일한 worker-execution 이미지를 재사용하고 CMD만 오버라이드.
+services:
+  api:
+    env_file: [.env.paper]
+    volumes: ["./:/app"]
+  worker-execution:
+    env_file: [.env.paper]
+    volumes: ["./:/app"]
+  worker-monitor:
+    env_file: [.env.paper]
+    volumes: ["./:/app"]
+  worker-market-kr:
+    env_file: [.env.paper]
+    volumes: ["./:/app"]
+  bot-telegram:
+    image: stock-bot-telegram:latest
+    env_file: [.env.paper]
+    volumes: ["./:/app"]
+  worker-agent:
+    image: stock-worker-execution:latest
+    command: ["python", "-m", "apps.worker_agent.__main__"]
+    env_file: [.env.paper]
+    volumes: ["./:/app"]
+  worker-strategy:
+    image: stock-worker-execution:latest
+    command: ["python", "-m", "apps.worker_strategy.__main__"]
+    env_file: [.env.paper]
+    volumes: ["./:/app"]

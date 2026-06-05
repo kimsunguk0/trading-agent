@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from dataclasses import asdict
 from decimal import Decimal
@@ -17,6 +18,9 @@ from agents.analysts.catalyst_hunter import CatalystHunter
 from agents.analysts.news_analyst import NewsAnalyst
 from agents.analysts.verification import VerificationAgent
 from core.events.schemas import NewsEvent
+
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_payload(value: Any) -> Any:
@@ -77,41 +81,49 @@ async def _consume_news(
                 except Exception:
                     continue
 
-                analysis = await analyst.analyze(event)
-                symbol = ""
-                if analysis.symbol_candidates:
-                    symbol = analysis.symbol_candidates[0].code
+                try:
+                    analysis = await analyst.analyze(event)
+                    if analysis is None:
+                        logger.warning("Skipping news item after invalid analyst output.", extra={"news_event_id": event.event_id})
+                        continue
 
-                catalyst = await catalyst_hunter.analyze(event, analysis)
-                bear_case = await bear_case_analyzer.assess(event, analysis, catalyst)
-                verification = await verification_agent.assess(event, symbol=symbol)
+                    symbol = ""
+                    if analysis.symbol_candidates:
+                        symbol = analysis.symbol_candidates[0].code
 
-                body_hash = str(
-                    event.payload.get("body_hash") if isinstance(event.payload, dict) else str(payload.get("body_hash", ""))
-                )
-                if not body_hash:
-                    body_hash = f"{event.title}|{event.body}"
-                analysis_dump = analysis.model_dump(mode="json")
-                symbol_name = ""
-                if analysis.symbol_candidates:
-                    symbol_name = str(analysis.symbol_candidates[0].name)
+                    catalyst = await catalyst_hunter.analyze(event, analysis)
+                    bear_case = await bear_case_analyzer.assess(event, analysis, catalyst)
+                    verification = await verification_agent.assess(event, symbol=symbol)
 
-                signal_payload = {
-                    "event_type": "news_analysis",
-                    "source": event.source,
-                    "body_hash": body_hash,
-                    "news_time": event.occurred_at.isoformat(),
-                    "symbol_name": symbol_name,
-                    "analysis": analysis_dump,
-                    "catalyst": asdict(catalyst),
-                    "bear_case": asdict(bear_case),
-                    "verification": asdict(verification),
-                }
+                    body_hash = str(
+                        event.payload.get("body_hash") if isinstance(event.payload, dict) else str(payload.get("body_hash", ""))
+                    )
+                    if not body_hash:
+                        body_hash = f"{event.title}|{event.body}"
+                    analysis_dump = analysis.model_dump(mode="json")
+                    symbol_name = ""
+                    if analysis.symbol_candidates:
+                        symbol_name = str(analysis.symbol_candidates[0].name)
 
-                await client.xadd(
-                    target,
-                    {"payload": json.dumps(_normalize_payload(signal_payload), ensure_ascii=False)},
-                )
+                    signal_payload = {
+                        "event_type": "news_analysis",
+                        "source": event.source,
+                        "body_hash": body_hash,
+                        "news_time": event.occurred_at.isoformat(),
+                        "symbol_name": symbol_name,
+                        "analysis": analysis_dump,
+                        "catalyst": asdict(catalyst),
+                        "bear_case": asdict(bear_case),
+                        "verification": asdict(verification),
+                    }
+
+                    await client.xadd(
+                        target,
+                        {"payload": json.dumps(_normalize_payload(signal_payload), ensure_ascii=False)},
+                    )
+                except Exception:
+                    logger.warning("Skipping news item after worker-agent analysis failure.", extra={"news_event_id": event.event_id}, exc_info=True)
+                    continue
 
 
 async def main() -> None:

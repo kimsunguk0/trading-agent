@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from collections import deque
 from dataclasses import dataclass
@@ -24,15 +25,18 @@ except Exception:  # pragma: no cover
     redis = None
 
 
+logger = logging.getLogger(__name__)
+
+
 def _to_decimal(value: Any) -> Decimal:
     if value is None:
         return Decimal("0")
     if isinstance(value, Decimal):
         return value
-    if isinstance(value, int):
-        return Decimal(value)
     if isinstance(value, bool):
         return Decimal("1") if value else Decimal("0")
+    if isinstance(value, int):
+        return Decimal(value)
     return Decimal(str(value))
 
 
@@ -57,48 +61,41 @@ class NewsAnalystOutput(BaseModel):
     required_checks: list[str] = Field(default_factory=list)
     should_trade_directly: bool = False
 
+    @field_validator("sentiment_score", "catalyst_score", "source_quality", mode="before")
+    @classmethod
+    def _coerce_score(cls, value: Any) -> Decimal:
+        if isinstance(value, str):
+            quality = value.strip().lower().replace("-", "_").replace(" ", "_")
+            quality_map = {
+                "very_high": Decimal("1.0"),
+                "high": Decimal("0.9"),
+                "medium_high": Decimal("0.75"),
+                "medium": Decimal("0.6"),
+                "mid": Decimal("0.6"),
+                "neutral": Decimal("0.5"),
+                "medium_low": Decimal("0.45"),
+                "low": Decimal("0.3"),
+                "very_low": Decimal("0.1"),
+            }
+            if quality in quality_map:
+                return quality_map[quality]
+        return _to_decimal(value)
+
+    @field_validator("bull_case", "bear_case", "required_checks", mode="before")
+    @classmethod
+    def _coerce_string_list(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return [str(value)]
+
     @field_validator("should_trade_directly")
     @classmethod
     def _force_false(cls, value: bool) -> bool:
         return False
-
-
-NEWS_ANALYST_JSON_SCHEMA = {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "type": "object",
-    "required": [
-        "symbol_candidates",
-        "event_type",
-        "sentiment",
-        "should_trade_directly",
-    ],
-    "properties": {
-        "symbol_candidates": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["market", "code", "name", "confidence"],
-                "properties": {
-                    "market": {"type": "string"},
-                    "code": {"type": "string"},
-                    "name": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                },
-            },
-        },
-        "event_type": {"type": "string"},
-        "sentiment": {"type": "string"},
-        "sentiment_score": {"type": "number", "minimum": -1, "maximum": 1},
-        "catalyst_score": {"type": "number", "minimum": 0, "maximum": 1},
-        "time_sensitivity": {"type": "string"},
-        "source_quality": {"type": "number", "minimum": 0, "maximum": 1},
-        "summary": {"type": "string", "maxLength": 500},
-        "bull_case": {"type": "array", "items": {"type": "string"}},
-        "bear_case": {"type": "array", "items": {"type": "string"}},
-        "required_checks": {"type": "array", "items": {"type": "string"}},
-        "should_trade_directly": {"const": False},
-    },
-}
 
 
 @dataclass
@@ -140,13 +137,25 @@ class NewsAnalyst:
         self.redis_url = redis_url
         self.llm_model = llm_model or os.getenv("LLM_MODEL", "Qwen/Qwen3.6-35B-A3B")
         self.llm_fallback_model = llm_fallback_model or os.getenv("LLM_FALLBACK_MODEL", "claude-haiku-4-5-20251001")
+        self.llm_api_url = llm_api_url or os.getenv("LLM_API_URL", "http://localhost:8000/v1")
+        self.llm_fallback_api_url = os.getenv("LLM_FALLBACK_API_URL", "").strip()
         self.cache_ttl_seconds = cache_ttl_seconds
         self._tracker = FailureTracker(window_seconds=60)
         self._last_degraded_at: datetime | None = None
         self.bus = RedisStreamBus(redis_url=redis_url or "redis://localhost:6379/0", stream_prefix=f"{environment}.events")
         self.client = AsyncOpenAI(
-            base_url=llm_api_url or os.getenv("LLM_API_URL", "http://localhost:8000/v1"),
+            base_url=self.llm_api_url,
             api_key=os.getenv("OPENAI_API_KEY", "EMPTY"),
+        )
+        self.fallback_client = (
+            AsyncOpenAI(
+                base_url=self.llm_fallback_api_url,
+                api_key=os.getenv("LLM_FALLBACK_API_KEY")
+                or os.getenv("ANTHROPIC_API_KEY")
+                or os.getenv("OPENAI_API_KEY", "EMPTY"),
+            )
+            if self.llm_fallback_api_url
+            else self.client
         )
         if redis_url and redis is not None:
             self._redis = redis.from_url(redis_url, decode_responses=True)
@@ -195,11 +204,22 @@ class NewsAnalyst:
             + json.dumps(payload, ensure_ascii=False)
         )
 
+    def _fallback_is_configured(self) -> bool:
+        if not self.llm_fallback_model or self.llm_fallback_model == self.llm_model:
+            return False
+        return bool(self.llm_fallback_api_url or os.getenv("ANTHROPIC_API_KEY", "").strip())
+
+    def _model_clients(self) -> list[tuple[str, Any]]:
+        candidates: list[tuple[str, Any]] = [(self.llm_model, self.client)]
+        if self._fallback_is_configured():
+            candidates.append((self.llm_fallback_model, self.fallback_client))
+        return candidates
+
     async def _call_model(self, prompt: str) -> tuple[dict[str, Any], int, int]:
         last_error: Exception | None = None
-        for model in (self.llm_model, self.llm_fallback_model):
+        for model, client in self._model_clients():
             try:
-                response = await self.client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=model,
                     temperature=0,
                     messages=[
@@ -220,10 +240,26 @@ class NewsAnalyst:
             except Exception as exc:  # pragma: no cover - network dependent
                 last_error = exc
                 continue
+        if (
+            last_error is not None
+            and self.llm_fallback_model
+            and self.llm_fallback_model != self.llm_model
+            and not self._fallback_is_configured()
+        ):
+            raise RuntimeError(
+                "LLM primary model failed; fallback model "
+                f"{self.llm_fallback_model!r} was skipped because neither "
+                "ANTHROPIC_API_KEY nor LLM_FALLBACK_API_URL is configured."
+            ) from last_error
         raise last_error or RuntimeError("llm call failed")
 
     def _to_decimal(self, value: Any) -> Decimal:
         return _to_decimal(value)
+
+    def _parse_output(self, payload: dict[str, Any]) -> NewsAnalystOutput:
+        coerced = dict(payload)
+        coerced["should_trade_directly"] = False
+        return NewsAnalystOutput(**coerced)
 
     async def _record_run(
         self,
@@ -311,13 +347,21 @@ class NewsAnalyst:
             _to_decimal(completion_tokens) * out_rate / Decimal("1000")
         )
 
-    async def analyze(self, event: NewsEvent, *, symbol_candidates: list[dict[str, Any]] | None = None) -> NewsAnalystOutput:
+    async def analyze(self, event: NewsEvent, *, symbol_candidates: list[dict[str, Any]] | None = None) -> NewsAnalystOutput | None:
         start = datetime.now(timezone.utc)
         content_hash = self._content_hash(event)
         cache_key = f"news_analyst:{content_hash}"
         cached = await self._cache_get(cache_key)
         if isinstance(cached, dict):
-            parsed = NewsAnalystOutput(**cached)
+            try:
+                parsed = self._parse_output(cached)
+            except Exception:
+                logger.warning("Skipping invalid cached news analysis payload.", exc_info=True)
+                parsed = None
+        else:
+            parsed = None
+
+        if parsed is not None:
             await self._record_run(
                 event=event,
                 content_hash=content_hash,
@@ -335,9 +379,26 @@ class NewsAnalyst:
         prompt = self._build_prompt(event, symbol_candidates or [])
         try:
             parsed_json, prompt_tokens, completion_tokens = await self._call_model(prompt)
-            parsed_json = dict(parsed_json)
-            parsed_json["should_trade_directly"] = False
-            parsed = NewsAnalystOutput(**parsed_json)
+        except Exception:
+            self._tracker.add(False)
+            if self._tracker.failure_rate() >= 0.10:
+                await self._publish_degraded_state()
+            raise
+
+        try:
+            parsed = self._parse_output(dict(parsed_json))
+        except Exception:
+            self._tracker.add(False)
+            logger.warning(
+                "Skipping news analysis with invalid LLM output.",
+                extra={"news_event_id": event.event_id, "llm_output": parsed_json},
+                exc_info=True,
+            )
+            if self._tracker.failure_rate() >= 0.10:
+                await self._publish_degraded_state()
+            return None
+
+        try:
             await self._cache_set(cache_key, parsed.model_dump(mode="json"), self.cache_ttl_seconds)
             latency_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
             await self._record_run(

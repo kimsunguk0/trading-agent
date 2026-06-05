@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -12,12 +13,15 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from core.events.bus import RedisStreamBus
-from core.events.schemas import EventType, OrderIntentEvent, RiskEvent, SignalEvent
+from core.events.schemas import ORDER_INTENTS_STREAM, EventType, OrderIntentEvent, RiskEvent, SignalEvent
 from core.models.market import Side
 from core.models.order import OrderRequest, RiskCheckResult
 from core.models.portfolio import Account
 from core.risk.gate import RiskGate
 from core.trading_controls import is_entry_allowed
+
+
+logger = logging.getLogger(__name__)
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -38,6 +42,31 @@ def _to_account(snapshot: Any) -> Account:
             currency=str(getattr(snapshot, "currency", "KRW")),
         )
     return Account(account_id="default", cash_balance=Decimal("0"))
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _price_from_level(value: Any) -> Decimal | None:
+    if isinstance(value, dict):
+        value = value.get("price")
+    if value in (None, ""):
+        return None
+    price = _to_decimal(value)
+    if price <= Decimal("0"):
+        return None
+    return price
+
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 @dataclass
@@ -73,14 +102,12 @@ class DecisionEngine:
         if hasattr(self.broker, "get_account"):
             accessor = getattr(self.broker, "get_account")
             if callable(accessor):
-                if inspect.iscoroutinefunction(accessor):
-                    return _to_account(await accessor(self.account_id))
-                value = accessor(self.account_id)
+                value = await _maybe_await(accessor(self.account_id))
                 return _to_account(value)
-        if hasattr(self.broker, "get_cash_snapshot"):
-            accessor = getattr(self.broker, "get_cash_snapshot")
-            if inspect.iscoroutinefunction(accessor):
-                snapshot = await accessor(self.account_id)
+        for method_name in ("get_cash", "get_cash_snapshot"):
+            accessor = getattr(self.broker, method_name, None)
+            if callable(accessor):
+                snapshot = await _maybe_await(accessor(self.account_id))
                 return _to_account(snapshot)
         return None
 
@@ -115,14 +142,134 @@ class DecisionEngine:
         symbol = signal.symbol.value
         return "KR" if symbol.isdigit() else "US"
 
+    def _execution_payload(self, signal: SignalEvent) -> dict[str, Any]:
+        execution = signal.payload.get("execution")
+        return execution if isinstance(execution, dict) else {}
+
+    def _order_type_from_signal(self, signal: SignalEvent) -> str:
+        execution = self._execution_payload(signal)
+        raw = signal.payload.get("order_type") or execution.get("order_type") or "MARKET"
+        return str(raw).upper()
+
+    def _allow_market_order(self, signal: SignalEvent) -> bool:
+        execution = self._execution_payload(signal)
+        if "allow_market_order" in signal.payload:
+            return _to_bool(signal.payload.get("allow_market_order"))
+        if "allow_market_order" in execution:
+            return _to_bool(execution.get("allow_market_order"))
+        return False
+
+    def _limit_price_basis(self, signal: SignalEvent) -> str:
+        execution = self._execution_payload(signal)
+        raw = signal.payload.get("limit_price_basis") or execution.get("limit_price_basis")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().lower()
+        return "best_bid" if signal.side == Side.SELL else "best_ask"
+
+    def _signal_price(self, signal: SignalEvent) -> Decimal | None:
+        price = signal.payload.get("price")
+        if price in (None, ""):
+            return None
+        resolved = _to_decimal(price)
+        if resolved <= Decimal("0"):
+            return None
+        return resolved
+
+    async def _call_market_data(self, method_name: str, symbol: str) -> dict[str, Any] | None:
+        accessor = getattr(self.broker, method_name, None)
+        if not callable(accessor):
+            return None
+        try:
+            payload = await _maybe_await(accessor(symbol))
+        except Exception:
+            logger.warning("Failed to fetch market data for limit price.", extra={"method": method_name, "symbol": symbol}, exc_info=True)
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _price_from_orderbook(self, orderbook: dict[str, Any], basis: str, side: Side) -> Decimal | None:
+        ask = (
+            _price_from_level(orderbook.get("best_ask"))
+            or _price_from_level(orderbook.get("ask"))
+            or _price_from_level((orderbook.get("asks") or [None])[0] if isinstance(orderbook.get("asks"), list) else None)
+        )
+        bid = (
+            _price_from_level(orderbook.get("best_bid"))
+            or _price_from_level(orderbook.get("bid"))
+            or _price_from_level((orderbook.get("bids") or [None])[0] if isinstance(orderbook.get("bids"), list) else None)
+        )
+        if basis in {"best_ask", "ask"}:
+            return ask
+        if basis in {"best_bid", "bid"}:
+            return bid
+        if basis == "mid" and ask is not None and bid is not None:
+            return (ask + bid) / Decimal("2")
+        return ask if side == Side.BUY else bid
+
+    def _price_from_quote(self, quote: dict[str, Any], basis: str, side: Side) -> Decimal | None:
+        ask = _price_from_level(quote.get("best_ask")) or _price_from_level(quote.get("ask"))
+        bid = _price_from_level(quote.get("best_bid")) or _price_from_level(quote.get("bid"))
+        last = _price_from_level(quote.get("price")) or _price_from_level(quote.get("last"))
+        if basis in {"best_ask", "ask"}:
+            return ask or last
+        if basis in {"best_bid", "bid"}:
+            return bid or last
+        if basis == "mid" and ask is not None and bid is not None:
+            return (ask + bid) / Decimal("2")
+        if basis in {"last", "price"}:
+            return last
+        if side == Side.BUY:
+            return ask or last
+        return bid or last
+
+    async def _resolve_limit_price(self, signal: SignalEvent) -> Decimal | None:
+        signal_price = self._signal_price(signal)
+        if signal_price is not None:
+            return signal_price
+
+        symbol = signal.symbol.value
+        basis = self._limit_price_basis(signal)
+        orderbook = await self._call_market_data("get_orderbook", symbol)
+        if orderbook is not None:
+            price = self._price_from_orderbook(orderbook, basis, signal.side)
+            if price is not None:
+                return price
+
+        quote = await self._call_market_data("get_quote", symbol)
+        if quote is not None:
+            return self._price_from_quote(quote, basis, signal.side)
+
+        return None
+
+    async def _resolve_order_pricing(self, signal: SignalEvent) -> tuple[str, Decimal | None] | None:
+        order_type = self._order_type_from_signal(signal)
+        if order_type != "LIMIT":
+            return order_type, None
+
+        price = await self._resolve_limit_price(signal)
+        if price is not None:
+            return order_type, price
+
+        if self._allow_market_order(signal):
+            logger.warning(
+                "Falling back to MARKET because limit price could not be resolved.",
+                extra={"symbol": signal.symbol.value, "strategy_id": signal.strategy_id},
+            )
+            return "MARKET", None
+
+        logger.warning(
+            "Skipping signal because LIMIT order has no resolvable price.",
+            extra={"symbol": signal.symbol.value, "strategy_id": signal.strategy_id},
+        )
+        return None
+
     async def _publish_order_intent(self, event: OrderIntentEvent) -> None:
         payload = event.model_dump(mode="json", by_alias=True)
         body = json.dumps(payload, ensure_ascii=False)
 
-        await self.bus.publish(event)
-
-        # Execution worker currently subscribes to `order_intents` (plural).
-        stream = self.bus.stream_name("order_intents")
+        # Canonical executable order-intent stream. Do not also publish through
+        # bus.publish(event), which maps EventType.ORDER_INTENT to singular
+        # `order_intent` and can create duplicate downstream side effects.
+        stream = self.bus.stream_name(ORDER_INTENTS_STREAM)
         if self.bus._client is None:
             self.bus._fallback_streams[stream].append(body)
             for queue in self.bus._fallback_subscribers.get(stream, []):
@@ -136,8 +283,10 @@ class DecisionEngine:
             return None
 
         quantity = self._qty_from_signal(signal)
-        price = signal.payload.get("price")
-        order_type = str(signal.payload.get("order_type", "MARKET"))
+        pricing = await self._resolve_order_pricing(signal)
+        if pricing is None:
+            return None
+        order_type, price = pricing
 
         market = self._market_from_signal(signal)
         if signal.side == Side.BUY:
@@ -170,7 +319,7 @@ class DecisionEngine:
             symbol=signal.symbol.value,
             side=signal.side.value,
             quantity=quantity,
-            price=_to_decimal(price) if price is not None else None,
+            price=price,
             order_type=order_type,
         )
 
