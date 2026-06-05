@@ -33,3 +33,9 @@ models/
 
 # macOS
 .DS_Store
+
+# 개인 트레이딩 전략 IP (개인 알파 — 절대 커밋 금지, 로컬에만 보존)
+# 설계서 §6/§22 전략 서술, 전략 YAML, 포트폴리오 배분
+SYSTEM_DESIGN_*.md
+configs/strategies/*.yaml
+configs/portfolio/allocator_v1.yaml
