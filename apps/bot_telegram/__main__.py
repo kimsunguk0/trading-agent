@@ -267,6 +267,16 @@ async def _close_client(client: Any) -> None:
         await result
 
 
+async def _redis_call(client: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+    method = getattr(client, method_name, None)
+    if not callable(method):
+        return None
+    result = method(*args, **kwargs)
+    if hasattr(result, "__await__"):
+        return await result
+    return result
+
+
 async def _publish_control_event(action: str, payload: dict[str, Any] | None = None) -> bool:
     client = _redis_client()
     if client is None:
@@ -685,6 +695,65 @@ def _candidate_payload_from_signal_message(message: dict[str, Any]) -> dict[str,
         if isinstance(payload, dict) and payload.get("event_type") == "news_candidate":
             return payload
     return None
+
+
+def _candidate_cursor_key() -> str:
+    return f"{_environment()}.bot.candidate_cursor"
+
+
+def _candidate_dedup_key() -> str:
+    return f"{_environment()}.bot.candidate_dedup"
+
+
+async def _store_candidate_cursor(client: Any, cursor: str) -> None:
+    try:
+        await _redis_call(client, "set", _candidate_cursor_key(), cursor)
+    except Exception as exc:
+        logger.warning("Failed to persist Telegram candidate cursor: %s", exc)
+
+
+async def _load_candidate_cursor(client: Any, stream: str) -> str:
+    try:
+        raw = await _redis_call(client, "get", _candidate_cursor_key())
+    except Exception as exc:
+        logger.warning("Failed to load Telegram candidate cursor: %s", exc)
+        raw = None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+
+    try:
+        rows = await _redis_call(client, "xrevrange", stream, count=1)
+    except Exception as exc:
+        logger.warning("Failed to initialize Telegram candidate cursor from stream tail: %s", exc)
+        rows = None
+    for message_id, _fields in _redis_entries(rows or []):
+        cursor = str(message_id)
+        await _store_candidate_cursor(client, cursor)
+        return cursor
+    return "$"
+
+
+def _candidate_dedup_value(payload: dict[str, Any], message_id: str) -> str:
+    for key in ("order_intent_id", "event_id"):
+        value = str(payload.get(key, "")).strip()
+        if value:
+            return f"{key}:{value}"
+    return f"redis:{message_id}"
+
+
+async def _reserve_candidate_notification(client: Any, payload: dict[str, Any], message_id: str) -> bool:
+    value = _candidate_dedup_value(payload, message_id)
+    try:
+        added = await _redis_call(client, "sadd", _candidate_dedup_key(), value)
+        await _redis_call(client, "expire", _candidate_dedup_key(), 7 * 24 * 60 * 60)
+    except Exception as exc:
+        logger.warning("Failed to reserve Telegram candidate dedup key: %s", exc)
+        return True
+    if added == 0:
+        return False
+    return True
 
 
 async def _send_candidate_notifications(payload: dict[str, Any], user_ids: list[int], token: str | None) -> None:
@@ -1457,7 +1526,7 @@ async def _candidate_listener() -> None:
     # carries news_candidate/news_analysis envelopes that are not core EventType
     # values, so Telegram reads raw JSON and filters only candidate notifications.
     stream = f"{_stream_prefix()}.{EventType.SIGNAL.value}"
-    cursor = "0-0"
+    cursor = await _load_candidate_cursor(client, stream)
     try:
         while True:
             try:
@@ -1474,11 +1543,17 @@ async def _candidate_listener() -> None:
                 raw = fields.get("payload") if isinstance(fields, dict) else None
                 message = _parse_signal_stream_payload(raw)
                 if message is None:
+                    await _store_candidate_cursor(client, cursor)
                     continue
                 payload = _candidate_payload_from_signal_message(message)
                 if payload is None:
+                    await _store_candidate_cursor(client, cursor)
+                    continue
+                if not await _reserve_candidate_notification(client, payload, cursor):
+                    await _store_candidate_cursor(client, cursor)
                     continue
                 await _send_candidate_notifications(payload, user_ids, os.getenv("TELEGRAM_BOT_TOKEN"))
+                await _store_candidate_cursor(client, cursor)
     finally:
         await _close_client(client)
 

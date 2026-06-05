@@ -33,6 +33,29 @@ def _context(*args: str) -> SimpleNamespace:
     return SimpleNamespace(args=list(args))
 
 
+def _candidate_payload(code: str, name: str, order_intent_id: str) -> dict[str, object]:
+    return {
+        "event_type": "news_candidate",
+        "code": code,
+        "symbol_name": name,
+        "strategy_id": "kr_news_breakout_v1",
+        "confidence": "0.81",
+        "regime": "bull_trend",
+        "news_summary": "실적 전망 상향",
+        "technical_summary": "장중 고점 돌파",
+        "risk": {
+            "position_pct": "1.7",
+            "spread_pct": "0.08",
+            "stop_loss_pct": "2.5",
+            "time_stop_minutes": "45",
+            "take_profit": [{"pct": "4.0"}, {"pct": "8.0"}],
+        },
+        "price": "78500",
+        "quantity": "12",
+        "order_intent_id": order_intent_id,
+    }
+
+
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
@@ -190,26 +213,7 @@ async def test_disable_market_blocks_shared_entry_control() -> None:
 async def test_candidate_listener_raw_stream_skips_unknown_and_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
     sent: list[tuple[int, str, str | None]] = []
 
-    candidate = {
-        "event_type": "news_candidate",
-        "code": "005930",
-        "symbol_name": "삼성전자",
-        "strategy_id": "kr_news_breakout_v1",
-        "confidence": "0.81",
-        "regime": "bull_trend",
-        "news_summary": "실적 전망 상향",
-        "technical_summary": "장중 고점 돌파",
-        "risk": {
-            "position_pct": "1.7",
-            "spread_pct": "0.08",
-            "stop_loss_pct": "2.5",
-            "time_stop_minutes": "45",
-            "take_profit": [{"pct": "4.0"}, {"pct": "8.0"}],
-        },
-        "price": "78500",
-        "quantity": "12",
-        "order_intent_id": "OI-TEST-1",
-    }
+    candidate = _candidate_payload("005930", "삼성전자", "OI-TEST-1")
     enveloped_candidate = {
         "event_type": "signal",
         "strategy_id": "kr_news_breakout_v1",
@@ -222,9 +226,26 @@ async def test_candidate_listener_raw_stream_skips_unknown_and_malformed(monkeyp
 
     class _FakeRedis:
         closed = False
+        values = {bot._candidate_cursor_key(): "2-0"}
+        dedup: set[str] = set()
 
         def __init__(self) -> None:
             self.calls = 0
+
+        async def get(self, key: str) -> str | None:
+            return self.values.get(key)
+
+        async def set(self, key: str, value: str) -> None:
+            self.values[key] = value
+
+        async def sadd(self, key: str, value: str) -> int:
+            if value in self.dedup:
+                return 0
+            self.dedup.add(value)
+            return 1
+
+        async def expire(self, _key: str, _seconds: int) -> None:
+            return None
 
         async def xread(self, *_args: object, **_kwargs: object) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
             self.calls += 1
@@ -267,3 +288,147 @@ async def test_candidate_listener_raw_stream_skips_unknown_and_malformed(monkeyp
     assert "[매수 후보] KR 005930 삼성전자" in sent[0][1]
     assert "[매수 후보] KR 000660 SK하이닉스" in sent[1][1]
     assert all("news_analysis" not in text for _chat_id, text, _token in sent)
+
+
+@pytest.mark.asyncio
+async def test_candidate_listener_initializes_cursor_at_stream_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[str] = []
+    old_candidate = _candidate_payload("005930", "삼성전자", "OI-OLD")
+    new_candidate = _candidate_payload("000660", "SK하이닉스", "OI-NEW")
+
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {}
+            self.dedup: set[str] = set()
+            self.xread_cursors: list[str] = []
+            self.closed = False
+            self.calls = 0
+
+        async def get(self, key: str) -> str | None:
+            return self.values.get(key)
+
+        async def set(self, key: str, value: str) -> None:
+            self.values[key] = value
+
+        async def xrevrange(self, _stream: str, count: int = 1) -> list[tuple[str, dict[str, str]]]:
+            assert count == 1
+            return [("4-0", {"payload": json.dumps(old_candidate, ensure_ascii=False)})]
+
+        async def xread(self, streams: dict[str, str], *_args: object, **_kwargs: object) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
+            self.calls += 1
+            cursor = next(iter(streams.values()))
+            self.xread_cursors.append(cursor)
+            if self.calls > 1:
+                raise asyncio.CancelledError()
+            assert cursor == "4-0"
+            return [("paper.events.signal", [("5-0", {"payload": json.dumps(new_candidate, ensure_ascii=False)})])]
+
+        async def sadd(self, _key: str, value: str) -> int:
+            if value in self.dedup:
+                return 0
+            self.dedup.add(value)
+            return 1
+
+        async def expire(self, _key: str, _seconds: int) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class _FakeBot:
+        def __init__(self, token: str | None = None) -> None:
+            self.token = token
+
+        async def send_message(self, chat_id: int, text: str) -> None:
+            sent.append(text)
+
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr(bot, "_redis_client", lambda: fake_redis)
+    monkeypatch.setattr(bot, "Bot", _FakeBot)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bot._candidate_listener()
+
+    assert fake_redis.closed is True
+    assert fake_redis.xread_cursors[0] == "4-0"
+    assert fake_redis.values[bot._candidate_cursor_key()] == "5-0"
+    assert len(sent) == 1
+    assert "SK하이닉스" in sent[0]
+    assert "삼성전자" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_candidate_listener_resume_cursor_and_deduplicates_order_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[str] = []
+    duplicate = _candidate_payload("005930", "삼성전자", "OI-DUP")
+    fresh = _candidate_payload("000660", "SK하이닉스", "OI-FRESH")
+
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self.values = {bot._candidate_cursor_key(): "5-0"}
+            self.dedup = {"order_intent_id:OI-DUP"}
+            self.xrevrange_called = False
+            self.xread_cursors: list[str] = []
+            self.closed = False
+            self.calls = 0
+
+        async def get(self, key: str) -> str | None:
+            return self.values.get(key)
+
+        async def set(self, key: str, value: str) -> None:
+            self.values[key] = value
+
+        async def xrevrange(self, *_args: object, **_kwargs: object) -> list[tuple[str, dict[str, str]]]:
+            self.xrevrange_called = True
+            return []
+
+        async def xread(self, streams: dict[str, str], *_args: object, **_kwargs: object) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
+            self.calls += 1
+            cursor = next(iter(streams.values()))
+            self.xread_cursors.append(cursor)
+            if self.calls > 1:
+                raise asyncio.CancelledError()
+            assert cursor == "5-0"
+            return [
+                (
+                    "paper.events.signal",
+                    [
+                        ("6-0", {"payload": json.dumps(duplicate, ensure_ascii=False)}),
+                        ("7-0", {"payload": json.dumps(fresh, ensure_ascii=False)}),
+                    ],
+                )
+            ]
+
+        async def sadd(self, _key: str, value: str) -> int:
+            if value in self.dedup:
+                return 0
+            self.dedup.add(value)
+            return 1
+
+        async def expire(self, _key: str, _seconds: int) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class _FakeBot:
+        def __init__(self, token: str | None = None) -> None:
+            self.token = token
+
+        async def send_message(self, chat_id: int, text: str) -> None:
+            sent.append(text)
+
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr(bot, "_redis_client", lambda: fake_redis)
+    monkeypatch.setattr(bot, "Bot", _FakeBot)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bot._candidate_listener()
+
+    assert fake_redis.closed is True
+    assert fake_redis.xrevrange_called is False
+    assert fake_redis.xread_cursors[0] == "5-0"
+    assert fake_redis.values[bot._candidate_cursor_key()] == "7-0"
+    assert len(sent) == 1
+    assert "SK하이닉스" in sent[0]
+    assert "삼성전자" not in sent[0]
