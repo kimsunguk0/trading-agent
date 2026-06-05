@@ -10,28 +10,32 @@ services:
   # GPU 그룹: vLLM OpenAI-compatible LLM
   # ============================
   llm-server:
-    image: vllm/vllm-openai:latest
+    # v0.10.0 = CUDA 12.8 빌드. latest(CUDA 13)는 드라이버 535(CUDA 12.2)와 메이저 불일치라 불가.
+    image: vllm/vllm-openai:v0.10.0
     restart: unless-stopped
     environment:
       CUDA_VISIBLE_DEVICES: "0"
       VLLM_GPU_MEMORY_UTILIZATION: "0.85"
       HF_HOME: /models/huggingface
+      # 드라이버 535에서 minor-버전 호환으로 구동 (런타임 cuda>=12.8 게이트 우회)
+      NVIDIA_DISABLE_REQUIRE: "1"
     volumes:
       - ./models:/models
     ports:
       - "127.0.0.1:8000:8000"
     networks: [trading_net]
+    # forward-compat 라이브러리 제거 → 호스트 드라이버(535) libcuda로 fallback 후 vLLM 기동
+    entrypoint: ["/bin/bash", "-lc"]
     command:
-      - --host
-      - "0.0.0.0"
-      - --port
-      - "8000"
-      - --model
-      - Qwen/Qwen3.6-35B-A3B
-      - --served-model-name
-      - Qwen/Qwen3.6-35B-A3B
-      - --gpu-memory-utilization
-      - "0.85"
+      - >
+        rm -rf /usr/local/cuda/compat && ldconfig 2>/dev/null;
+        exec python3 -m vllm.entrypoints.openai.api_server
+        --host 0.0.0.0 --port 8000
+        --model /models/Qwen3-30B-A3B-Instruct-2507-AWQ
+        --served-model-name Qwen3-30B-A3B-Instruct-2507
+        --gpu-memory-utilization 0.92
+        --max-model-len 16384
+        --enforce-eager
     deploy:
       resources:
         reservations:
