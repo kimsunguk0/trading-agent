@@ -191,6 +191,7 @@ services:
     environment:
       <<: *common-env
       WORKER_NAME: bot-telegram
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
       REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
       API_URL: http://api:8000
