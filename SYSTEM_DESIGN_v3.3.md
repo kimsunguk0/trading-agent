@@ -7,7 +7,7 @@
 
 ## 변경 이력
 
-### v3.3 (2026-06-05) — 실전 전략 카탈로그 + 신규 에이전트
+### v3.3 (2026-06-05) — 실전 전략 카탈로그 + 실인프라 통합·검증
 사용자 매매 스킬 6개를 시스템에 정식 반영:
 - **§22 신설 — 전략 카탈로그**: 5개 실전 전략 YAML 추가
   - `volume_spike_no_move_v1` (거래량 급증 + 가격 횡보 = 은밀한 매집)
@@ -20,6 +20,15 @@
 - **신규 유니버스 config**: `us_themes.yaml`, `theme_us_kr_map.yaml`
 - 각 전략별 함정(pitfall)과 백테스트 우선 검증 항목 명시
 - §4 에이전트 카탈로그·§19 레포 구조·§20 MVP 로드맵에 반영
+
+실인프라 통합·검증 (2026-06-05):
+- **§3 브로커**: `kiwoom_rest_kr_{mock,live}`를 실제 키움 REST OpenAPI로 재구현. 기존 한국투자증권(KIS) 국내 로직은 `kis_domestic_kr_{mock,live}`로 분리 보존.
+- **키움 TR 실측 반영**: 주문 `kt10000/kt10001/kt10002/kt10003`(`ordr`), 예수금 `kt00001`·잔고 `kt00018`(`acnt`), 시세 `ka10001`(`stkinfo`), 호가 `ka10004`(`mrkcond`), WebSocket `0B/0D`.
+- **§10 LLM**: 개발·운영 모두 vLLM(OpenAI 호환 `:8000/v1`)로 정리. 모델은 실제 사용 가능한 `Qwen3-30B-A3B-Instruct-2507` AWQ 4bit로 정정.
+- **안전·정합성**: bootstrap fail-fast, broker/env/schema 3중 검증, DB 영속 idempotency, Position Monitor, 승인·취소 상태 머신, 이벤트 리플레이 구현 반영.
+- **파이프라인 통합**: `order_intent` 이벤트 `request` 필드 파싱, `order_intents` 스트림 단일화, async 키움 브로커 await, LIMIT 가격 결정 로직, NewsAnalyst vLLM `json_object` 호환 반영.
+- **§14 ChatOps**: 명령 23개로 확장하고 `/halt`·승격·비활성화 명령을 실제 시스템 상태/DB 제어로 연결.
+- **§23 구현·검증 현황 신설**: MVP0 smoke, 키움 모의서버 실측, PAPER end-to-end 검증과 남은 미완 항목 명시.
 
 ### v3.2 (2026-05-29) — 컨테이너 운영 전략 보강
 §15 운영 인프라 대폭 확장 (40줄 → 220줄):
@@ -75,6 +84,7 @@ v2 보강 + 사용자 문서 통합. 33개 에이전트, YAML 전략, 3중 Risk 
 20. [MVP 로드맵](#20-mvp-로드맵)
 21. [부록: 핵심 인터페이스/스키마](#21-부록-핵심-인터페이스스키마)
 22. [전략 카탈로그 (실전 매매 스킬)](#22-전략-카탈로그-실전-매매-스킬)
+23. [구현·검증 현황](#23-구현검증-현황-2026-06-05)
 
 ---
 
@@ -289,16 +299,20 @@ class BrokerAdapter(Protocol):
         """거래정지/관리종목/VI 등 체크"""
 ```
 
+`ExecutionEngine`은 브로커 adapter가 동기/비동기 어느 형태로 구현되어도 안전하게 처리한다. `account_lookup`, `get_cash`/`get_cash_snapshot`, `submit_order`/`place_order` 결과가 coroutine이면 await하고, 동기 `SimulatedBrokerAdapter` 경로는 그대로 지원한다. Risk Gate에는 최소 `.cash_balance`, `.available_cash`를 가진 `CashSnapshot`/Account 형태가 전달되어야 한다.
+
 ### 3.2 구현체 매핑 및 개발 순서
 
 | 순서 | Adapter | 시장 | 환경 | 시점 | 목적 |
 |---|---|---|---|---|---|
 | **1** | **`SimulatedBrokerAdapter`** ★ | KR/US | 완전 로컬 | **MVP 0** | API 없이 시스템 검증 |
-| 2 | `KiwoomRestKrMockAdapter` | KR | 모의 | MVP 1~ | 키움 API 첫 통합 |
-| 3 | `KiwoomRestKrLiveAdapter` | KR | 실전 | MVP 3~ | |
-| 4 | `KisOverseasMockAdapter` | US | 모의 | MVP 5 | |
-| 5 | `KisOverseasLiveAdapter` | US | 실전 | MVP 5+ | |
-| 6 | `TossInvestAdapter` | KR/US | 실전 | API 출시 후 | |
+| 2 | `KiwoomRestKrMockAdapter` | KR | 모의 | 구현·실측 완료 | 실제 키움 REST 모의투자 |
+| 3 | `KiwoomRestKrLiveAdapter` | KR | 실전 | MVP 3~ | 실제 키움 REST 실전 |
+| 4 | `KisDomesticKrMockAdapter` | KR | 모의 | 보존 | 한국투자증권(KIS) 국내 |
+| 5 | `KisDomesticKrLiveAdapter` | KR | 실전 | 보존 | 한국투자증권(KIS) 국내 |
+| 6 | `KisOverseasMockAdapter` | US | 모의 | MVP 5 | KIS 해외주식 |
+| 7 | `KisOverseasLiveAdapter` | US | 실전 | MVP 5+ | KIS 해외주식 |
+| 8 | `TossInvestAdapter` | KR/US | 실전 | API 출시 후 | |
 
 **왜 Simulated가 먼저인가**: 주문 상태 머신·idempotency·Risk Gate·`/halt`·Reconciliation은 외부 API 없이도 검증되어야 함. 처음부터 키움 API에 붙이면 API 이슈와 시스템 버그가 섞여 디버깅 불가능. Simulated는 다음을 시뮬레이션:
 - 네트워크 타임아웃 (확률적)
@@ -307,6 +321,52 @@ class BrokerAdapter(Protocol):
 - 응답 지연
 - 호가 잔량 기반 체결 가능성
 - `UNKNOWN_SUBMITTED` 시나리오 (응답 받기 전 끊김)
+
+**BROKER_ADAPTER 식별자**:
+- `simulated`: 로컬 시뮬레이션
+- `kiwoom_mock`, `kiwoom_live`: 실제 키움 REST OpenAPI
+- `kis_kr_mock`, `kis_kr_live`: 한국투자증권(KIS) 국내 API
+- `kis_overseas_mock`, `kis_overseas_live`: KIS 해외주식 API
+
+### 3.2.1 키움 REST OpenAPI 구현 현황
+
+`kiwoom_rest_kr_{mock,live}`는 실제 키움 REST OpenAPI 스펙으로 동작한다. 이전 구현처럼 `openapi.koreainvestment.com:9443`, `CANO`, `appsecret`, KIS `TR_ID`를 사용하지 않는다.
+
+| 구분 | 모의 | 실전 |
+|---|---|---|
+| REST host | `https://mockapi.kiwoom.com` | `https://api.kiwoom.com` |
+| WebSocket | `wss://mockapi.kiwoom.com:10000/api/dostk/websocket` | `wss://api.kiwoom.com:10000/api/dostk/websocket` |
+| override | `KIWOOM_BASE_URL`, `KIWOOM_WS_URL` | `KIWOOM_BASE_URL`, `KIWOOM_WS_URL` |
+
+**인증 및 공통 헤더**:
+- 토큰 발급: `POST /oauth2/token`, body `{"grant_type":"client_credentials","appkey": "...","secretkey": "..."}`
+- 토큰 응답: `token`, `token_type`, `expires_dt`, `return_code`, `return_msg`
+- 공통 헤더: `authorization: Bearer <token>`, `api-id`, `cont-yn`, `next-key`, `Content-Type: application/json;charset=UTF-8`
+- 성공 판정은 HTTP status가 아니라 응답 본문의 `return_code == 0`
+
+**TR 매핑표**:
+
+| 메서드 | api-id | path | 비고 |
+|---|---:|---|---|
+| `submit_order`/`place_order` 매수 | `kt10000` | `/api/dostk/ordr` | `ord_no` → `broker_order_id` |
+| `submit_order`/`place_order` 매도 | `kt10001` | `/api/dostk/ordr` | `ord_no` → `broker_order_id` |
+| `modify_order` | `kt10002` | `/api/dostk/ordr` | 요청 필드는 공식문서 기준, 실측 대기 |
+| `cancel_order` | `kt10003` | `/api/dostk/ordr` | 요청 필드는 공식문서 기준, 실측 대기 |
+| `get_cash` | `kt00001` | `/api/dostk/acnt` | body `{"qry_tp":"1"}` |
+| `get_positions` | `kt00018` | `/api/dostk/acnt` | body `{"qry_tp":"1","dmst_stex_tp":"KRX"}` |
+| `get_quote` | `ka10001` | `/api/dostk/stkinfo` | body `{"stk_cd":"005930"}` |
+| `get_orderbook` | `ka10004` | `/api/dostk/mrkcond` | body `{"stk_cd":"005930"}` |
+| `stream_quotes` | `0B`, `0D` | WebSocket | `0B` 주식체결, `0D` 호가잔량 |
+
+정정·취소 요청 필드, 주문상태 조회 응답 필드, 계좌 체결/잔고 WebSocket(`00`/`04`)은 아직 실측 전이므로 구현에 TODO를 남기고 방어적으로 파싱한다. `0B`는 실시간 시세 체결이며 계좌 체결 통보로 사용하지 않는다.
+
+**키움 응답 파싱 특이점**:
+- 숫자는 zero-pad 문자열이다. 예: `"000000010000000"` → `10000000`
+- 음수는 선행 `-`와 zero-pad를 함께 쓴다. 예: `"-00000000003166"` → `-3166`
+- 소수도 문자열이다. 예: `"-00000000.89"` → `-0.89`
+- 보유종목 응답의 종목코드는 `A005930`처럼 `A` 프리픽스가 붙으므로 내부 정규화 시 제거한다.
+- 시세·호가 가격 필드의 `+`/`-`는 가격 부호가 아니라 전일대비 방향 표시다. 가격은 절댓값으로 파싱하고, 전일대비(`pred_pre`, FID `11`)와 등락률(`flu_rt`, FID `12`)만 실제 부호로 파싱한다.
+- WebSocket `PING` 프레임은 받은 원문을 그대로 echo한다.
 
 ### 3.3 BrokerCapabilities 모델 (★ 신규)
 
@@ -407,7 +467,7 @@ if not adapter.capabilities.supports_client_order_id:
 
 각 어댑터가 흡수해야 할 차이:
 
-- **인증**: OAuth2 (KIS) vs API key (키움) vs OCX (구 키움)
+- **인증**: 키움 OAuth2(`appkey`/`secretkey`/`token`/`expires_dt`) vs KIS OAuth2·hashkey vs 토스(출시 후 확정)
 - **주문 단위**: 한국 주식은 1주, 미국 주식은 fractional 가능
 - **호가 단위**: 가격대별 호가 단위 다름 (한국)
 - **시장가/지정가**: 시장가 미지원 시장 대응
@@ -500,6 +560,7 @@ if not adapter.capabilities.supports_client_order_id:
 - **Post-Mortem Agent**: 매일 손실 트레이드 재분석, 일지 누적.
 - **Journal / RAG Agent**: 매매일지 벡터화 → 의사결정 시 "비슷한 과거 상황" 검색.
 - **Strategy Drift Detector**: 백테스트 vs 라이브 성과 괴리 모니터링.
+- **Position Monitor**: Strategy/Decision 워커와 독립적으로 보유 포지션의 손절·익절·시간손절을 결정론적으로 평가한다. worker-monitor에 포함되어 Decision 워커 장애 중에도 보유 포지션 보호가 유지된다.
 
 ---
 
@@ -552,9 +613,8 @@ class SignalEvent(Event):
 
 class OrderIntentEvent(Event):
     event_type: Literal["order_intent"] = "order_intent"
-    order_intent_id: str
-    strategy_id: str
-    # ... OrderRequest fields ...
+    request: OrderRequest        # 실제 주문 데이터는 request 필드에 담는다
+    payload: dict = {}           # backward compatibility용, 신규 발행은 비워 둔다
 
 class FillEvent(Event):
     event_type: Literal["fill"] = "fill"
@@ -606,6 +666,8 @@ events.fills
 events.reconciliation
 events.system_state
 ```
+
+`order_intent`의 canonical stream은 복수형 `events.order_intents`다. Publisher는 `OrderIntentEvent.request`에 `OrderRequest`를 넣고, consumer(worker_execution)는 `request`를 우선 파싱한다. 과거 메시지 호환을 위해 `payload` fallback은 허용하지만, 중복 발주 방지를 위해 singular/plural 이중 발행은 금지한다.
 
 ### 5.3 시간 처리 원칙
 
@@ -711,6 +773,8 @@ approval:
 ```
 
 **3단계 (코드)**: Strategy Engine이 YAML을 로드해서 시세·뉴스 이벤트에 매칭. 새 전략 추가는 YAML 파일 추가만으로 가능.
+
+`execution.order_type`, `execution.limit_price_basis`, `execution.allow_market_order`는 signal/order_intent 변환 시 보존된다. `DecisionEngine`은 `order_type=limit`이면 시그널 가격을 우선 사용하고, 없으면 브로커 `get_orderbook`/`get_quote`의 `best_ask`(매수) 또는 `best_bid`(매도)로 `limit_price`를 결정한다. 시세 조회 실패 시 `allow_market_order=true`인 전략만 시장가로 폴백하고, 그렇지 않으면 intent를 생성하지 않는다. 가격 없는 지정가 주문은 금지한다.
 
 ### 6.2 전략 카탈로그 (예시)
 
@@ -903,6 +967,12 @@ def make_idempotency_key(order_intent_id: str) -> str:
 3. 브로커가 `duplicate_order` 반환 시 기존 주문 조회로 폴백
 4. `order_intent_id`는 DB에 UNIQUE 제약
 
+**영속화 구현 규칙**:
+- `order_intents.idempotency_key TEXT UNIQUE NOT NULL`, `status TEXT NOT NULL`, `updated_at TIMESTAMPTZ`를 DB에 저장한다.
+- `SUBMITTED`, `UNKNOWN_SUBMITTED` 같은 비종결 상태는 worker 재시작 후 로드해서 동일 계좌·종목·방향 신규 주문을 계속 차단한다.
+- `FILLED`, `CANCELED`, `REJECTED`, `EXPIRED` 등 terminal 상태는 기존 intent의 재사용을 차단한다. 새 주문은 새 `order_intent_id`와 새 `idempotency_key`를 가져야 한다.
+- DB 연결이 없을 때는 테스트·로컬 경로에서 Redis 또는 in-memory fallback을 쓰되, live/paper 운영은 DB 영속화를 기준으로 한다.
+
 ### 8.3 재시도 정책
 
 - 네트워크 에러: 지수 백오프로 3회 재시도, 같은 `idempotency_key`로 재전송
@@ -955,7 +1025,7 @@ Docker Compose:
 **강제 사항**:
 1. paper 워커는 live 키에 접근 불가 (Vault 권한 분리)
 2. live 워커는 `paper.events.*` 스트림 구독 불가
-3. 시스템 부팅 시 `ENVIRONMENT` 변수 검증: 키와 스트림과 DB 스키마가 일치하지 않으면 즉시 종료
+3. 시스템 부팅 시 `ENVIRONMENT` 변수 검증: 브로커 키 환경, Redis prefix, DB 스키마가 일치하지 않으면 `FatalConfigError`로 즉시 종료
 4. 단일 머신에서 paper와 live를 동시에 돌리지 말 것. 적어도 컨테이너 단위로 격리.
 
 **부팅 시 검증 예시**:
@@ -971,6 +1041,8 @@ def validate_environment_consistency():
             f"Environment mismatch: env={env}, key={broker_key_env}, db={db_schema}"
         )
 ```
+
+`validate_bootstrap()`/`boot_or_raise()`는 mismatch를 warning이나 기본값 fallback으로 처리하지 않는다. `broker_key_env == ENVIRONMENT == db_schema suffix` 3중 일치가 깨지면 fail-fast로 프로세스를 종료한다. 특히 live 키와 paper 스키마, paper 키와 live 스트림 조합은 부팅 단계에서 차단한다.
 
 ### 9.2 System State (시스템 건강도)
 
@@ -1000,10 +1072,10 @@ def validate_environment_consistency():
 
 | 작업 | 위치 | 모델 | 이유 |
 |---|---|---|---|
-| 뉴스 1차 분류 | 로컬 | Qwen3.6-35B-A3B (MoE) | 양 많음, 비용 폭발 방지 |
-| 종목명→티커 매핑 | 로컬 | Qwen3.6-35B-A3B | 양 많음 |
+| 뉴스 1차 분류 | 로컬 | Qwen3-30B-A3B-Instruct-2507 (AWQ 4bit) | 양 많음, 비용 폭발 방지 |
+| 종목명→티커 매핑 | 로컬 | Qwen3-30B-A3B-Instruct-2507 (AWQ 4bit) | 양 많음 |
 | 임베딩 생성 (RAG) | 로컬 | bge-m3 | 상시 |
-| 공시 요약 | 로컬 | Qwen3.6-27B dense | 깊이 필요 |
+| 공시 요약 | 로컬 | Qwen3-30B-A3B-Instruct-2507 (AWQ 4bit) | 깊이 필요 |
 | 시그널 후보 랭킹·근거 설명 | 로컬 또는 Claude | 상황별 | LLM은 랭킹·설명만, order_intent 생성은 결정론적 정책 엔진 |
 | Daily Briefing | 클라우드 | Claude Sonnet | 글 품질 |
 | Post-Mortem 일일 리뷰 | 클라우드 또는 로컬 야간 | 상황별 | 1일 1회 |
@@ -1013,20 +1085,29 @@ def validate_environment_consistency():
 ### 10.2 3090 24GB VRAM 배분 (시나리오 C 추천)
 
 ```
-Qwen3.6-35B-A3B Q4    →  20 GB   (메인: 뉴스·분석·종합)
+Qwen3-30B-A3B-Instruct-2507 AWQ 4bit → 18 GB   (메인: 뉴스·분석·종합)
 bge-m3 embedding      →   2 GB   (RAG·유사도)
 ─────────────────────────────────
-                         22 GB   (여유 2GB)
+                         20 GB   (여유 4GB)
 ```
 
-서빙: **vLLM** (운영) / Ollama (개발)
+서빙: **vLLM** (개발·운영 동일), OpenAI 호환 `http://llm-server:8000/v1`.
+
+운영 노트:
+- 설계 초안의 `Qwen3.6-35B-A3B`는 실제 배포 가능한 모델명으로 확인되지 않아 `Qwen3-30B-A3B-Instruct-2507`로 정정한다.
+- RTX 3090 24GB에서는 AWQ 4bit safetensors를 사용한다. Ollama용 GGUF는 vLLM에서 사용할 수 없다.
+- NVIDIA driver 535(CUDA 12.2) 호스트에서는 CUDA 13 기반 vLLM latest를 쓰지 않는다. `vllm/vllm-openai:v0.10.0`(CUDA 12.8)로 pin하고, 컨테이너 시작 시 `/usr/local/cuda/compat`를 제거해 호스트 `libcuda` minor compatibility를 사용한다.
+- 24GB OOM 회피를 위해 `--enforce-eager`, `--gpu-memory-utilization 0.85`, `NVIDIA_DISABLE_REQUIRE=1`을 적용한다.
+- 위 설정은 `docker-compose.llm.yml`의 `llm-server`에 반영한다. `embedding-server`(bge-m3, `:8001`)는 분리 유지한다.
 
 ### 10.3 LLM 출력 통제
 
-- 모든 LLM 출력은 **JSON Schema 강제**
+- 로컬 vLLM 호출은 `response_format={"type":"json_object"}`를 사용한다. Decimal 필드의 JSON Schema regex가 xgrammar/outlines에서 거부될 수 있으므로 `guided_json` strict schema는 사용하지 않는다.
+- 출력 정합성은 Pydantic validation과 방어적 coercion으로 강제한다. 예: `source_quality: "high"` → `Decimal("0.9")`, `bull_case: "..."` → `["..."]`.
 - 매매 권한 필드는 항상 `should_trade_directly: false`
 - 출력 캐싱: `content_hash → response` (같은 뉴스 두 번 안 보내기)
 - 프롬프트 버전 관리: `prompt_version`, `prompt_hash` 기록
+- 로컬 단일 vLLM endpoint에 존재하지 않는 fallback 모델은 blind retry하지 않는다. 외부 fallback은 별도 base URL 또는 `ANTHROPIC_API_KEY`가 있을 때만 호출한다.
 
 ### 10.4 비용·성능 추적
 
@@ -1168,14 +1249,14 @@ signals (
 -- 주문 의도
 order_intents (
   id TEXT PRIMARY KEY,           -- order_intent_id
-  idempotency_key TEXT UNIQUE,
+  idempotency_key TEXT UNIQUE NOT NULL,
   strategy_id TEXT,
   symbol_market TEXT,
   symbol_code TEXT,
   side TEXT,
   quantity NUMERIC,
   limit_price NUMERIC,
-  status TEXT,
+  status TEXT NOT NULL,
   risk_result_json JSONB,
   created_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ
@@ -1245,6 +1326,19 @@ system_state_log (
   created_at TIMESTAMPTZ
 );
 
+-- 종목/시장 단위 진입 차단 (ChatOps Kill Switch L2/L3)
+trading_controls (
+  id UUID PRIMARY KEY,
+  scope TEXT,                   -- 'symbol' | 'market'
+  market TEXT,
+  symbol_code TEXT,
+  is_blocked BOOLEAN,
+  reason TEXT,
+  triggered_by TEXT,
+  created_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ
+);
+
 -- 일일 성과
 daily_performance (
   date DATE,
@@ -1290,6 +1384,8 @@ async def replay_day(date: date, strategy_ids: list[str]):
         # 주문은 SimulatedBrokerAdapter가 체결 시뮬레이션
         # 슬리피지·수수료·세금 반영
 ```
+
+현재 구현에는 `core/clock.py`의 `TickClock`, 리플레이용 `ReplayEventBus`, `scripts/replay_day.py`가 포함된다. 목적은 OHLCV만 보는 백테스트가 아니라 뉴스·공시·시세·주문 이벤트를 시간순으로 재생해 Strategy/Decision/Risk/Execution 경로 전체를 검증하는 것이다.
 
 ### 12.2 백테스트 함정 방지
 
@@ -1378,6 +1474,7 @@ journal_entries:
 /promote LIVE_AUTO --strategy=X  전략별 LIVE_AUTO 승격
 /halt                            전체 자동매매 중단
 /resume_paper                    모의투자만 재개
+/resume_live                     LIVE_APPROVAL 등 live 운용 재개
 /positions                       보유 종목 + 평가손익
 /today                           오늘 매매 요약
 /watch                           감시 중인 종목
@@ -1387,11 +1484,22 @@ journal_entries:
 /risk                            현재 리스크 한도 사용량
 /strategies                      활성 전략 목록 + 성과
 /disable <STRATEGY_ID>           특정 전략 비활성
+/disable_symbol <CODE>           특정 종목 신규 진입 차단 (L2)
+/disable_market <KR|US>          특정 시장 신규 진입 차단 (L3)
 /regime                          현재 시장 국면
 /logs                            최근 에러/경고
 /briefing                        Daily Briefing 즉시 생성
+/daily_report                    일일 리포트 조회/생성
 /journal <DATE>                  특정 날짜 매매일지
 ```
+
+현재 Telegram 봇은 위 23개 명령을 등록한다. 조회성 명령은 DB/Redis가 없으면 "데이터 없음"으로 안전 응답하고, 위험 명령은 allowlist와 audit log를 반드시 통과한다.
+
+실동작 연결:
+- `/halt`: `SystemStateMachine.halt()`를 통해 공유 system state를 `HALTED`로 전이하고, 미체결 취소 트리거를 기록한다. 워커는 Redis/DB system state 경로를 읽어 신규 주문을 차단한다.
+- `/resume_paper`, `/resume_live`: `can_resume_command()`와 사람 명시 명령 규칙을 확인한 뒤 `PAPER` 또는 `LIVE_APPROVAL` 계열로 복귀한다. `EMERGENCY_STOP`은 사람 명시 명령 없이는 해제하지 않는다.
+- `/promote`: `--confirm`이 있는 경우에만 전략별 모드를 승격하고, 이력 검증 실패 시 차단한다.
+- `/disable`, `/disable_symbol`, `/disable_market`: 전략·종목·시장 단위 차단을 DB(`strategy_modes`, `trading_controls`)에 영속화하고 신규 진입 필터에서 반영한다.
 
 ### 14.2 알림 등급
 
@@ -1446,8 +1554,9 @@ RAG: 과거 비슷한 상황 3건 평균 +4.2% (45분 보유)
 ### 14.4 보안
 
 - 명령 실행 가능 user_id allowlist
-- `/approve`, `/halt`, `/promote`, `/resume_*` 등 위험 명령은 2분 만료 토큰
+- `/approve`, `/halt`, `/promote`, `/resume_*`, `/disable*`, `/mode set LIVE_*` 등 위험 명령은 2분 만료 토큰 또는 `--confirm` 요구
 - 모든 명령은 `audit_log` 테이블에 append-only 기록
+- 시스템 상태 변경은 봇 로컬 메모리가 아니라 Redis/DB 공유 상태에 기록해 API·worker_execution·worker_monitor에 전파
 
 ---
 
@@ -1512,7 +1621,7 @@ MVP 0 + 추가:
   + qdrant                    (벡터 DB / RAG)
 
 [GPU] +2
-  + llm-server                (vLLM + Qwen3.6-35B-A3B)
+  + llm-server                (vLLM + Qwen3-30B-A3B-Instruct-2507 AWQ)
   + embedding-server          (bge-m3)
 
 [Data] +1
@@ -1579,7 +1688,7 @@ MVP 0 + 추가:
 | redis | 2 GB | - | 1 | maxmemory 1.5GB, eviction policy=allkeys-lru |
 | minio | 2 GB | - | 1 | |
 | qdrant | 4 GB | - | 2 | (MVP 2+) |
-| llm-server | 8 GB | 18~20 GB | 4 | vLLM + Qwen3.6-35B-A3B Q4 |
+| llm-server | 8 GB | 18~20 GB | 4 | vLLM + Qwen3-30B-A3B-Instruct-2507 AWQ |
 | embedding-server | 4 GB | 2~3 GB | 2 | bge-m3 |
 | worker-market-* | 1~2 GB | - | 1 | WebSocket 유지 |
 | worker-news | 2 GB | - | 1 | HTTP 크롤링 + 파싱 |
@@ -1611,6 +1720,11 @@ llm-server:
   environment:
     - CUDA_VISIBLE_DEVICES=0
     - VLLM_GPU_MEMORY_UTILIZATION=0.85   # 20.4GB까지
+    - NVIDIA_DISABLE_REQUIRE=1
+  command:
+    - sh
+    - -lc
+    - "rm -rf /usr/local/cuda/compat && vllm serve Qwen/Qwen3-30B-A3B-Instruct-2507-AWQ --host 0.0.0.0 --port 8000 --gpu-memory-utilization 0.85 --enforce-eager"
 
 embedding-server:
   deploy:
@@ -1966,10 +2080,13 @@ trading-agent/
 │   ├── base.py                       # BrokerAdapter Protocol
 │   ├── capabilities.py               # ★ BrokerCapabilities 모델
 │   ├── simulated.py                  # ★ MVP 0 (외부 API 없음)
-│   ├── kiwoom_rest_kr_mock.py        # MVP 1~
-│   ├── kiwoom_rest_kr_live.py        # MVP 3
-│   ├── kis_overseas_mock.py          # MVP 5
-│   ├── kis_overseas_live.py          # MVP 5+
+│   ├── kiwoom_rest_kr_base.py        # 실제 키움 REST/WS 공통 구현
+│   ├── kiwoom_rest_kr_mock.py        # 실제 키움 모의투자
+│   ├── kiwoom_rest_kr_live.py        # 실제 키움 실전
+│   ├── kis_domestic_kr_mock.py       # KIS 국내 모의, 기존 코드 분리 보존
+│   ├── kis_domestic_kr_live.py       # KIS 국내 실전
+│   ├── kis_overseas_mock.py          # KIS 해외주식 모의
+│   ├── kis_overseas_live.py          # KIS 해외주식 실전
 │   └── toss_invest_future.py         # API 출시 후
 │
 ├── agents/
@@ -2060,6 +2177,9 @@ trading-agent/
 ├── infra/
 │   ├── docker-compose.yml
 │   ├── docker-compose.dev.yml
+│   ├── docker-compose.paper.yml
+│   ├── docker-compose.live.yml
+│   ├── docker-compose.llm.yml         # vLLM + bge-m3
 │   ├── prometheus.yml
 │   ├── grafana/
 │   │   └── dashboards/
@@ -2093,6 +2213,8 @@ trading-agent/
 ---
 
 ## 20. MVP 로드맵
+
+아래는 단계별 목표 원안이다. 2026-06-05 기준 실제 구현·검증 상태는 §23에 별도로 정리한다.
 
 ### MVP 0 (1주) — 골격 (외부 API 없음)
 
@@ -2137,7 +2259,7 @@ trading-agent/
 
 **목표**: 뉴스 기반 의사결정 + 시장 국면 인식
 
-- vLLM + Qwen3.6 세팅
+- vLLM + Qwen3-30B-A3B-Instruct-2507 AWQ 세팅
 - News Collector + Entity Resolver
 - News Analyst + Catalyst Hunter + Bear Case (Local Qwen)
 - Verification Agent
@@ -2146,7 +2268,7 @@ trading-agent/
 - Macro Calendar Agent
 - 뉴스 기반 전략 YAML: `kr_news_breakout_v1`
 - 추가 전략: **`candle_probability_v1`** (§22.4, 스킬 #5 — 백테스트로 승률 검증 연습)
-- JSON Schema 강제 + 출력 캐싱
+- `response_format=json_object` + Pydantic coercion + 출력 캐싱
 
 **완료 기준**: 장중 호재 뉴스 → 5분 내 매수 후보 텔레그램 알림. PAPER 모드에서 자동 발주.
 
@@ -2246,6 +2368,8 @@ trading-agent/
 }
 ```
 
+이 schema는 검증 기준 문서다. 현재 vLLM 호출은 strict `guided_json`이 아니라 `response_format=json_object`로 JSON 객체만 요구하고, 위 구조는 Pydantic validation과 coercion 단계에서 강제한다. 로컬 vLLM endpoint에 없는 fallback 모델은 `ANTHROPIC_API_KEY` 또는 별도 fallback base URL이 없으면 호출하지 않는다.
+
 ### 21.2 catalyst_score 가중치 (튜닝 가능)
 
 ```yaml
@@ -2273,12 +2397,12 @@ catalyst_score:
 roles:
   decision_engine:
     role: candidate_ranking_and_explanation
-    primary: local-qwen-35b-a3b
+    primary: local-qwen-30b-a3b
     fallback: claude-sonnet
     may_create_signal: true
     may_create_order_intent: false      # ★ LLM은 order_intent 생성 불가
     may_place_order: false
-    require_json_schema: true
+    require_json_object: true
 
   final_decision_policy:
     role: deterministic_policy_engine    # ★ 순수 코드, LLM 없음
@@ -2293,18 +2417,18 @@ roles:
 
 routing:
   news_analyst:
-    primary: local-qwen-35b-a3b
+    primary: local-qwen-30b-a3b
     fallback: claude-haiku
     cache_ttl_seconds: 3600
 
   catalyst_hunter:
-    primary: local-qwen-35b-a3b
+    primary: local-qwen-30b-a3b
     fallback: claude-haiku
 
   signal_ranker:                         # 시그널 랭킹 (의사결정 X)
     primary: claude-sonnet
-    fallback: local-qwen-27b
-    require_json_schema: true
+    fallback: local-qwen-30b-a3b
+    require_json_object: true
 
   daily_briefing:
     primary: claude-sonnet
@@ -2628,6 +2752,39 @@ risk:
 
 ---
 
+## 23. 구현·검증 현황 (2026-06-05)
+
+### 23.1 통과한 검증
+
+- MVP0 end-to-end smoke 기준 4개 통과:
+  1. `/status` → 시뮬 계좌 잔고 표시
+  2. 수동 trigger → `order_intent` → 3중 Risk Gate → SimulatedBroker 체결 → 포지션/잔고 반영
+  3. `UNKNOWN_SUBMITTED`/idempotency 재시작 시나리오에서 중복 주문 차단
+  4. `/halt` Kill Switch로 신규 주문 차단
+- 로컬 테스트 기준: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q`에서 112 passed 확인.
+- bootstrap fail-fast, idempotency DB/Redis 영속화, Position Monitor, 승인/취소 상태머신은 단위·스모크 테스트로 검증.
+
+### 23.2 실인프라 실측 완료
+
+- 키움 모의서버:
+  - `/oauth2/token` 토큰 발급
+  - `kt00001` 예수금, `kt00018` 잔고
+  - `kt10000` 매수, `kt10001` 매도
+  - `ka10001` 시세, `ka10004` 호가
+  - WebSocket LOGIN/REG/PING/REAL `0B`·`0D`
+- PAPER end-to-end:
+  - 키움 시세 → 전략 → DecisionEngine → worker_execution → 키움 주문/체결 경로 검증
+  - 뉴스 수동 주입 → vLLM(Qwen) → NewsAnalyst → 분석 signal 경로 검증
+
+### 23.3 현재 미완·운영 대기
+
+- worker-news 자동수집은 아직 상시 가동 검증 전이다. 현재 뉴스 경로는 수동 주입으로 검증했다.
+- 후보 → Telegram 자동 발화는 장중 실데이터 조건이 충족되는 상황에서 추가 관찰이 필요하다.
+- 워커 운영은 dev bind mount 기반이다. 정식 운영 이미지는 재빌드·배포 검증이 남아 있다.
+- Vault는 설계에 남아 있으나 실제 secret routing에는 아직 적용되지 않았다. 현재는 env 기반이며 키 하드코딩은 금지한다.
+
+---
+
 
 
 1. **LLM은 의견, 코드는 결정.** 매매 권한은 결정론적 코드에만.
@@ -2640,9 +2797,9 @@ risk:
 8. **비용은 측정 가능해야 한다.** agent_runs에 토큰·비용 기록.
 
 **다음 작업 후보**:
-- (a) `core/operating_mode.py` + `system_state.py` 실제 구현 (안전망 골격)
-- (b) `brokers/base.py` + `kiwoom_rest_kr_mock.py` 실제 구현 (첫 주문)
-- (c) 본인 매매 스킬 → YAML 전략 변환 워크숍
+- (a) worker-news 자동수집 상시 가동 및 후보 → Telegram 자동 알림 장중 검증
+- (b) 정식 운영 이미지 재빌드와 paper/live 배포 리허설
+- (c) Vault 기반 secret routing 적용
 
 권장 순서: **(a) → (b) → (c)**.
-안전망 → 진짜 주문 → 본인 스킬 이전.
+데이터 자동화 → 운영 배포 → secret 관리.
