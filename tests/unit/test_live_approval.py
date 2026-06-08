@@ -102,7 +102,7 @@ async def test_approve_rejected_for_non_allowed_user(monkeypatch: pytest.MonkeyP
 
     await bot.cmd_approve(update, context)
 
-    assert messages == ["권한이 없습니다."]
+    assert messages == ["🔒 권한이 없습니다."]
     bot.approve_order_intent.assert_not_called()
 
 

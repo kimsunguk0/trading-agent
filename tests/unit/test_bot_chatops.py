@@ -73,9 +73,9 @@ async def test_status_gracefully_reports_without_database() -> None:
     await bot.cmd_status(update, _context())
 
     text = update.message.texts[-1]
-    assert "상태 요약:" in text
+    assert "📊 상태 요약" in text
     assert "시스템: NORMAL" in text
-    assert "잔고: 데이터 없음" in text
+    assert "💰 계좌: 데이터 없음" in text
 
 
 @pytest.mark.asyncio
@@ -91,7 +91,8 @@ async def test_halt_transitions_system_state_and_triggers_cancel(monkeypatch: py
 
     await bot.cmd_halt(update, _context())
 
-    assert "HALT 적용: 상태=HALTED" in update.message.texts[-1]
+    assert "🛑 HALT 적용" in update.message.texts[-1]
+    assert "상태: HALTED" in update.message.texts[-1]
     assert published[-1][0] == "cancel_open_orders"
     assert published[-1][1]["state"] == "HALTED"
 
@@ -112,7 +113,7 @@ async def test_resume_paper_human_resume_from_halted(monkeypatch: pytest.MonkeyP
 
     assert manager.state == SystemState.NORMAL
     assert bot._FALLBACK_RUNTIME_MODES["paper"] == "PAPER"
-    assert "운영모드=PAPER" in update.message.texts[-1]
+    assert "운영모드: PAPER" in update.message.texts[-1]
 
 
 @pytest.mark.asyncio
@@ -146,11 +147,12 @@ async def test_mode_set_live_auto_requires_confirm_then_persists() -> None:
     update = _update()
 
     await bot.cmd_mode(update, _context("set", "LIVE_AUTO"))
-    assert "LIVE 계열 모드는 --confirm" in update.message.texts[-1]
+    assert "LIVE 계열 모드 변경은 --confirm" in update.message.texts[-1]
 
     await bot.cmd_mode(update, _context("set", "LIVE_AUTO", "--confirm"))
     assert bot._FALLBACK_RUNTIME_MODES["paper"] == "LIVE_AUTO"
-    assert "운영모드 변경 완료: LIVE_AUTO" in update.message.texts[-1]
+    assert "✅ 운영모드 변경 완료" in update.message.texts[-1]
+    assert "현재: LIVE_AUTO" in update.message.texts[-1]
 
 
 @pytest.mark.asyncio
@@ -285,8 +287,9 @@ async def test_candidate_listener_raw_stream_skips_unknown_and_malformed(monkeyp
     assert len(sent) == 2
     assert sent[0][0] == 123
     assert sent[0][2] == "test-token"
-    assert "[매수 후보] KR 005930 삼성전자" in sent[0][1]
-    assert "[매수 후보] KR 000660 SK하이닉스" in sent[1][1]
+    assert "🚨 매수 후보  삼성전자(005930)" in sent[0][1]
+    assert "💸 제안: 지정가 78,500원 × 12주" in sent[0][1]
+    assert "🚨 매수 후보  SK하이닉스(000660)" in sent[1][1]
     assert all("news_analysis" not in text for _chat_id, text, _token in sent)
 
 

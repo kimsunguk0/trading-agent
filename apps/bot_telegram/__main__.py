@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -108,6 +108,71 @@ def _fmt_decimal(value: Any) -> str:
     except Exception:
         return str(value)
     return f"{number.normalize():f}"
+
+
+def _fmt_number(value: Any, *, places: int = 0, signed: bool = False) -> str:
+    try:
+        number = _to_decimal(value)
+    except Exception:
+        return str(value)
+    quant = Decimal("1") if places <= 0 else Decimal("1").scaleb(-places)
+    number = number.quantize(quant, rounding=ROUND_HALF_UP)
+    prefix = "+" if signed and number > 0 else ""
+    if places <= 0:
+        return f"{prefix}{number:,.0f}"
+    return f"{prefix}{number:,.{places}f}"
+
+
+def _fmt_quantity(value: Any) -> str:
+    try:
+        quantity = _to_decimal(value)
+    except Exception:
+        return str(value)
+    if quantity == quantity.to_integral_value():
+        return f"{quantity:,.0f}주"
+    return f"{quantity.normalize():,f}주"
+
+
+def _fmt_money(value: Any, currency: str = "KRW", *, signed: bool = False) -> str:
+    normalized = str(currency).upper()
+    if normalized in {"KRW", "₩"}:
+        return f"{_fmt_number(value, places=0, signed=signed)}원"
+    return f"{_fmt_number(value, places=2, signed=signed)} {normalized}"
+
+
+def _fmt_pct(value: Any, *, signed: bool = True, places: int = 1) -> str:
+    return f"{_fmt_number(value, places=places, signed=signed)}%"
+
+
+def _trend_emoji(value: Any) -> str:
+    try:
+        number = _to_decimal(value)
+    except Exception:
+        return "➖"
+    if number > 0:
+        return "🔺"
+    if number < 0:
+        return "🔻"
+    return "➖"
+
+
+def _fmt_time(value: Any) -> str:
+    if value is None:
+        return "시각 미확인"
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return str(value)
+
+
+def _fmt_text(value: Any, default: str = "-") -> str:
+    text = str(value or "").strip()
+    return text if text else default
+
+
+def _progress_bar(ratio: Decimal, width: int = 10) -> str:
+    ratio = max(Decimal("0"), min(Decimal("1"), ratio))
+    filled = int((ratio * width).to_integral_value(rounding=ROUND_HALF_UP))
+    return "█" * filled + "░" * (width - filled)
 
 
 def _environment() -> str:
@@ -632,26 +697,29 @@ def _format_candidate(payload: dict[str, Any]) -> str:
     price = _to_decimal(payload.get("price", payload.get("intended_price", "0")))
     quantity = _to_decimal(payload.get("quantity", payload.get("order_quantity", "0")))
     order_intent_id = str(payload.get("order_intent_id", "")).strip()
+    market = str(payload.get("market", "KR")).strip().upper() or "KR"
+    currency = "KRW" if market == "KR" else "USD"
+    score = confidence * Decimal("100") if Decimal("0") <= confidence <= Decimal("1") else confidence
 
     lines = [
-        f"[매수 후보] KR {code} {symbol_name}",
-        f"전략: {strategy_id}",
-        f"점수: {confidence}",
-        f"국면: {regime}",
-        f"뉴스: {news_summary}",
-        f"차트: {technical_summary}",
-        f"리스크: 단일종목 비중 {position_pct}%, 스프레드 {spread_pct}%",
+        f"🚨 매수 후보  {symbol_name or code}({code})",
+        f"전략: {_fmt_text(strategy_id)} · 국면: {_fmt_text(regime, '미산출')}",
+        f"신뢰도: {_fmt_pct(score, signed=False, places=1)}",
         "",
-        f"제안: 지정가 {price}원 x {quantity}주",
-        f"손절: -{stop_loss}% / 익절: +{tps[0]}%, +{tps[1]}% / 시간손절: {time_stop}분",
+        f"📰 뉴스: {_fmt_text(news_summary, '요약 없음')}",
+        f"📈 차트: {_fmt_text(technical_summary, '요약 없음')}",
+        "",
+        f"💸 제안: 지정가 {_fmt_money(price, currency)} × {_fmt_quantity(quantity)}",
+        f"⚠️ 리스크: 비중 {_fmt_pct(position_pct, signed=False)} · 스프레드 {_fmt_pct(spread_pct, signed=False)}",
+        f"손절 -{_fmt_pct(stop_loss, signed=False)} · 익절 +{_fmt_pct(tps[0], signed=False)}, +{_fmt_pct(tps[1], signed=False)} · 시간손절 {time_stop}분",
         "",
     ]
 
     if _approval_mode():
-        lines.append("상태: 수동 승인 대기 (만료 2분)")
-        lines.append(f"명령어: /approve {order_intent_id}" if order_intent_id else "명령어: /approve <ORDER_INTENT_ID>")
+        lines.append("⏳ 상태: 수동 승인 대기(2분 만료)")
+        lines.append(f"승인: /approve {order_intent_id}" if order_intent_id else "승인: /approve <ORDER_INTENT_ID>")
     else:
-        lines.append("상태: 모의 자동발주")
+        lines.append("✅ 상태: 모의 자동발주 대상")
     return "\n".join(lines)
 
 
@@ -856,6 +924,41 @@ async def _fetch_account_snapshot(account_id: str) -> dict[str, Any] | None:
     return None
 
 
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+async def _fetch_quote_price(symbol: str) -> Decimal | None:
+    adapter_name = os.getenv("BROKER_ADAPTER", "simulated").strip().lower()
+    try:
+        if adapter_name == "kiwoom_mock":
+            from brokers.kiwoom_rest_kr_mock import KiwoomRestKrMockAdapter
+
+            broker: Any = KiwoomRestKrMockAdapter()
+        elif adapter_name == "kiwoom_live":
+            from brokers.kiwoom_rest_kr_live import KiwoomRestKrLiveAdapter
+
+            broker = KiwoomRestKrLiveAdapter()
+        else:
+            from brokers.simulated import SimulatedBrokerAdapter
+
+            broker = SimulatedBrokerAdapter()
+
+        if hasattr(broker, "get_quote"):
+            quote = await _maybe_await(broker.get_quote(symbol))
+            if isinstance(quote, dict):
+                for key in ("price", "current_price", "cur_prc", "last"):
+                    if quote.get(key) is not None:
+                        return _to_decimal(quote[key])
+        if hasattr(broker, "get_market_tick"):
+            return _to_decimal(await _maybe_await(broker.get_market_tick(symbol)))
+    except Exception:
+        logger.warning("Failed to fetch quote fallback for Telegram position.", extra={"symbol": symbol}, exc_info=True)
+    return None
+
+
 async def _status_lines() -> list[str]:
     state = await _latest_system_state()
     mode = await _get_runtime_mode()
@@ -864,61 +967,133 @@ async def _status_lines() -> list[str]:
     position_count = await _fetch_open_position_count(account_id)
 
     lines = [
-        "상태 요약:",
+        "📊 상태 요약",
         f"시스템: {state.value}",
         f"운영모드: {mode.value}",
         f"계좌: {account_id}",
     ]
     if account is None:
-        lines.append("잔고: 데이터 없음")
+        lines.append("💰 계좌: 데이터 없음")
     else:
+        currency = str(account.get("currency") or "KRW")
         lines.append(
-            f"잔고: {_fmt_decimal(account['cash_balance'])} {account['currency']} "
-            f"(가용 {_fmt_decimal(account['available_cash'])})"
+            f"💰 예수금: {_fmt_money(account['cash_balance'], currency)}"
         )
-    lines.append(f"보유종목 수: {position_count}")
+        lines.append(f"주문가능: {_fmt_money(account['available_cash'], currency)}")
+    lines.append(f"📦 보유종목: {position_count}개")
     return lines
 
 
 async def _positions_lines() -> list[str]:
     conn = await _db_connect()
     if conn is None:
-        return ["포지션 데이터 없음(DB 미연결)."]
+        return ["📊 보유 포지션", "⚠️ 일시적으로 데이터를 불러오지 못했습니다(DB 미연결)."]
 
+    position_queries = (
+        f"""
+        SELECT s.symbol, COALESCE(i.name, '') AS symbol_name, s.quantity, s.average_price,
+               NULL::NUMERIC AS current_price, NULL::NUMERIC AS unrealized_pnl,
+               s.realized_pnl, s.snapshot_time
+        FROM (
+            SELECT DISTINCT ON (symbol)
+                symbol,
+                quantity,
+                average_price,
+                realized_pnl,
+                snapshot_time
+            FROM {_schema()}.position_snapshots
+            WHERE account_id = $1
+            ORDER BY symbol, snapshot_time DESC
+        ) s
+        LEFT JOIN {_schema()}.instruments i ON i.symbol = s.symbol
+        WHERE s.quantity <> 0
+        ORDER BY s.symbol ASC
+        """,
+        f"""
+        SELECT s.symbol, '' AS symbol_name, s.quantity, s.average_price,
+               NULL::NUMERIC AS current_price, NULL::NUMERIC AS unrealized_pnl,
+               s.realized_pnl, s.snapshot_time
+        FROM (
+            SELECT DISTINCT ON (symbol)
+                symbol,
+                quantity,
+                average_price,
+                realized_pnl,
+                snapshot_time
+            FROM {_schema()}.position_snapshots
+            WHERE account_id = $1
+            ORDER BY symbol, snapshot_time DESC
+        ) s
+        WHERE s.quantity <> 0
+        ORDER BY s.symbol ASC
+        """,
+        f"""
+        SELECT s.symbol_code AS symbol, COALESCE(i.name, '') AS symbol_name, s.quantity,
+               s.avg_price AS average_price, s.market_price AS current_price,
+               s.unrealized_pnl, s.realized_pnl, s.captured_at AS snapshot_time
+        FROM (
+            SELECT DISTINCT ON (symbol_code)
+                symbol_code,
+                quantity,
+                avg_price,
+                market_price,
+                unrealized_pnl,
+                realized_pnl,
+                captured_at
+            FROM {_schema()}.position_snapshots
+            WHERE account_id = $1
+            ORDER BY symbol_code, captured_at DESC
+        ) s
+        LEFT JOIN {_schema()}.instruments i ON i.symbol_code = s.symbol_code
+        WHERE s.quantity <> 0
+        ORDER BY s.symbol_code ASC
+        """,
+    )
     try:
-        rows = await conn.fetch(
-            f"""
-            SELECT symbol, quantity, average_price, realized_pnl, snapshot_time
-            FROM (
-                SELECT DISTINCT ON (symbol)
-                    symbol,
-                    quantity,
-                    average_price,
-                    realized_pnl,
-                    snapshot_time
-                FROM {_schema()}.position_snapshots
-                WHERE account_id = $1
-                ORDER BY symbol, snapshot_time DESC
-            ) s
-            WHERE quantity <> 0
-            ORDER BY symbol ASC
-            """,
-            _account_id(),
-        )
+        rows = []
+        for query in position_queries:
+            try:
+                rows = await conn.fetch(query, _account_id())
+                break
+            except Exception:
+                continue
     except Exception:
         rows = []
     finally:
         await conn.close()
 
     if not rows:
-        return ["보유 포지션 없음."]
+        return ["📊 보유 포지션", "보유 포지션이 없습니다."]
 
-    lines = ["보유 포지션:"]
+    lines = ["📊 보유 포지션"]
     for row in rows[:20]:
-        lines.append(
-            f"- {_row_value(row, 'symbol')}: qty={_fmt_decimal(_row_value(row, 'quantity'))}, "
-            f"avg={_fmt_decimal(_row_value(row, 'average_price'))}, "
-            f"realized_pnl={_fmt_decimal(_row_value(row, 'realized_pnl'))}"
+        symbol = _fmt_text(_row_value(row, "symbol"))
+        name = _fmt_text(_row_value(row, "symbol_name"), symbol)
+        quantity = _to_decimal(_row_value(row, "quantity", "0"))
+        average_price = _to_decimal(_row_value(row, "average_price", "0"))
+        current_price_raw = _row_value(row, "current_price")
+        current_price = _to_decimal(current_price_raw) if current_price_raw is not None else None
+        if current_price is None or current_price <= Decimal("0"):
+            current_price = await _fetch_quote_price(symbol)
+        pnl_raw = _row_value(row, "unrealized_pnl")
+        pnl = _to_decimal(pnl_raw) if pnl_raw is not None else None
+        if pnl is None and current_price is not None and average_price > Decimal("0"):
+            pnl = (current_price - average_price) * quantity
+        pnl_pct = Decimal("0")
+        if pnl is not None and average_price > Decimal("0") and quantity != Decimal("0"):
+            pnl_pct = (pnl / (average_price * quantity)) * Decimal("100")
+
+        avg_text = "평단 미확정" if average_price <= Decimal("0") else f"평단 {_fmt_money(average_price)}"
+        current_text = "현재가 미확정" if current_price is None or current_price <= Decimal("0") else f"현재 {_fmt_money(current_price)}"
+        pnl_text = "평가손익 미확정"
+        if pnl is not None:
+            pnl_text = f"평가손익 {_fmt_money(pnl, signed=True)}({_fmt_pct(pnl_pct)}) {_trend_emoji(pnl)}"
+
+        lines.extend(
+            [
+                f"• {name}({symbol})  {_fmt_quantity(quantity)}",
+                f"  {avg_text} · {current_text} · {pnl_text}",
+            ]
         )
     return lines
 
@@ -926,7 +1101,7 @@ async def _positions_lines() -> list[str]:
 async def _today_lines() -> list[str]:
     conn = await _db_connect()
     if conn is None:
-        return ["금일 거래 데이터 없음(DB 미연결)."]
+        return ["📈 오늘 요약", "⚠️ 일시적으로 데이터를 불러오지 못했습니다(DB 미연결)."]
 
     fill_count = 0
     notional = Decimal("0")
@@ -965,40 +1140,45 @@ async def _today_lines() -> list[str]:
         await conn.close()
 
     return [
-        "금일 요약:",
-        f"체결 건수: {fill_count}",
-        f"거래대금: {_fmt_decimal(notional)}",
-        f"슬리피지 기록: {slippage_count}",
-        f"실현/슬리피지 PnL 추정: {_fmt_decimal(slippage_pnl)}",
+        "📈 오늘 요약",
+        f"체결: {fill_count:,}건",
+        f"거래대금: {_fmt_money(notional)}",
+        f"슬리피지 기록: {slippage_count:,}건",
+        f"PnL 추정: {_fmt_money(slippage_pnl, signed=True)} {_trend_emoji(slippage_pnl)}",
     ]
 
 
 async def _watch_lines() -> list[str]:
     payloads = await _fetch_candidate_payloads(limit=10)
     if not payloads:
-        return ["감시 중 종목 데이터 없음."]
+        return ["👀 감시중", "감시 중인 종목이 없습니다."]
 
-    lines = ["감시 중 종목:"]
+    lines = ["👀 감시중"]
     seen: set[str] = set()
     for payload in payloads:
         symbol = str(payload.get("code") or payload.get("symbol", "")).strip()
         if not symbol or symbol in seen:
             continue
         seen.add(symbol)
+        name = _fmt_text(payload.get("symbol_name"), symbol)
         reason = str(payload.get("watch_reason") or payload.get("reason") or payload.get("news_summary") or "").strip()
-        score = str(payload.get("confidence", ""))
-        lines.append(f"- {symbol}: score={score} {reason}".rstrip())
-    return lines if len(lines) > 1 else ["감시 중 종목 데이터 없음."]
+        score = _to_decimal(payload.get("confidence", "0"))
+        if Decimal("0") <= score <= Decimal("1"):
+            score *= Decimal("100")
+        lines.append(f"• {name}({symbol})  신뢰도 {_fmt_pct(score, signed=False)}")
+        if reason:
+            lines.append(f"  {reason}")
+    return lines if len(lines) > 1 else ["👀 감시중", "감시 중인 종목이 없습니다."]
 
 
 async def _regime_lines() -> list[str]:
     client = _redis_client()
     if client is None:
-        return ["시장 국면: 미산출"]
+        return ["🧭 국면", "현재 시장 국면은 아직 미산출입니다."]
     try:
         raw = await client.get(f"{_environment()}:regime:current")
         if raw:
-            return [f"시장 국면: {raw}"]
+            return ["🧭 국면", f"현재: {raw}"]
         rows = await client.xrevrange(f"{_stream_prefix()}.regime", count=1)
         for _message_id, fields in _redis_entries(rows):
             payload_raw = fields.get("payload")
@@ -1010,20 +1190,27 @@ async def _regime_lines() -> list[str]:
                 continue
             regime = payload.get("regime") or payload.get("payload", {}).get("regime")
             if regime:
-                return [f"시장 국면: {regime}"]
+                confidence = payload.get("confidence") or payload.get("payload", {}).get("confidence")
+                lines = ["🧭 국면", f"현재: {regime}"]
+                if confidence is not None:
+                    score = _to_decimal(confidence)
+                    if Decimal("0") <= score <= Decimal("1"):
+                        score *= Decimal("100")
+                    lines.append(f"신뢰도: {_fmt_pct(score, signed=False)}")
+                return lines
     except Exception:
-        return ["시장 국면: 미산출"]
+        return ["🧭 국면", "⚠️ 일시적으로 데이터를 불러오지 못했습니다."]
     finally:
         await _close_client(client)
-    return ["시장 국면: 미산출"]
+    return ["🧭 국면", "현재 시장 국면은 아직 미산출입니다."]
 
 
 async def _logs_lines() -> list[str]:
     conn = await _db_connect()
     if conn is None:
-        return ["최근 로그 데이터 없음(DB 미연결)."]
+        return ["🪵 로그", "⚠️ 일시적으로 데이터를 불러오지 못했습니다(DB 미연결)."]
 
-    lines = ["최근 경고/상태 로그:"]
+    lines = ["🪵 로그", "최근 경고/상태 변경"]
     try:
         rows = await conn.fetch(
             f"""
@@ -1035,7 +1222,8 @@ async def _logs_lines() -> list[str]:
             """
         )
         for row in rows:
-            lines.append(f"- risk {str(_row_value(row, 'stage', ''))}: {str(_row_value(row, 'reason', ''))}")
+            lines.append(f"• ⚠️ Risk {_fmt_text(_row_value(row, 'stage'))}")
+            lines.append(f"  {_fmt_text(_row_value(row, 'reason'), '사유 없음')} · {_fmt_time(_row_value(row, 'created_at'))}")
     except Exception:
         pass
 
@@ -1060,12 +1248,13 @@ async def _logs_lines() -> list[str]:
             except Exception:
                 continue
             for row in rows:
-                lines.append(f"- state {str(_row_value(row, 'state', ''))}: {str(_row_value(row, 'reason', ''))}")
+                lines.append(f"• 🧭 State {_fmt_text(_row_value(row, 'state'))}")
+                lines.append(f"  {_fmt_text(_row_value(row, 'reason'), '사유 없음')} · {_fmt_time(_row_value(row, 'created_at'))}")
             break
     finally:
         await conn.close()
 
-    return lines if len(lines) > 1 else ["최근 경고/상태 로그 없음."]
+    return lines if len(lines) > 2 else ["🪵 로그", "최근 경고나 상태 변경이 없습니다."]
 
 
 async def _strategy_modes_all() -> dict[str, tuple[str, bool]]:
@@ -1092,28 +1281,31 @@ async def _strategies_lines() -> list[str]:
     modes = await _strategy_modes_all()
     ids.update(modes.keys())
     if not ids:
-        return ["전략 목록 없음."]
+        return ["📋 전략", "등록된 전략이 없습니다."]
 
-    lines = ["전략 목록:"]
+    lines = ["📋 전략"]
+    file_ids = _read_strategy_file_ids()
     for strategy_id in sorted(ids):
         mode, active = modes.get(strategy_id, ("PAPER", True))
-        status = "active" if active else "disabled"
-        source = "file" if strategy_id in _read_strategy_file_ids() else "db"
-        lines.append(f"- {strategy_id}: {mode}, {status}, source={source}")
+        status = "활성" if active else "비활성"
+        source = "파일" if strategy_id in file_ids else "DB"
+        icon = "✅" if active else "⛔"
+        lines.append(f"• {icon} {strategy_id}")
+        lines.append(f"  모드 {mode} · 상태 {status} · 출처 {source}")
     return lines
 
 
 async def _journal_lines(day_text: str | None) -> list[str]:
     if not day_text:
-        return ["사용법: /journal YYYY-MM-DD"]
+        return ["📓 매매일지", "사용법: /journal YYYY-MM-DD"]
     try:
         day = date.fromisoformat(day_text)
     except ValueError:
-        return ["날짜 형식 오류: YYYY-MM-DD"]
+        return ["📓 매매일지", "날짜 형식이 맞지 않습니다. 예: /journal 2026-06-08"]
 
     conn = await _db_connect()
     if conn is None:
-        return [f"{day.isoformat()} 매매일지 데이터 없음(DB 미연결)."]
+        return ["📓 매매일지", f"{day.isoformat()}", "⚠️ 일시적으로 데이터를 불러오지 못했습니다(DB 미연결)."]
 
     try:
         rows = await conn.fetch(
@@ -1132,15 +1324,16 @@ async def _journal_lines(day_text: str | None) -> list[str]:
         await conn.close()
 
     if not rows:
-        return [f"{day.isoformat()} 매매일지 없음."]
-    lines = [f"{day.isoformat()} 매매일지:"]
+        return ["📓 매매일지", f"{day.isoformat()} 기록이 없습니다."]
+    lines = ["📓 매매일지", day.isoformat()]
     for row in rows:
         narrative = str(_row_value(row, "narrative", "") or _row_value(row, "lessons", "") or "").strip()
-        lines.append(
-            f"- {str(_row_value(row, 'symbol_code', ''))} "
-            f"{str(_row_value(row, 'strategy_id', ''))}: pnl={_fmt_decimal(_row_value(row, 'pnl', '0'))} "
-            f"pct={_fmt_decimal(_row_value(row, 'pnl_pct', '0'))} {narrative}".rstrip()
-        )
+        pnl = _to_decimal(_row_value(row, "pnl", "0"))
+        pnl_pct = _to_decimal(_row_value(row, "pnl_pct", "0"))
+        lines.append(f"• {_fmt_text(_row_value(row, 'symbol_code'))}  {_fmt_money(pnl, signed=True)}({_fmt_pct(pnl_pct)}) {_trend_emoji(pnl)}")
+        lines.append(f"  전략: {_fmt_text(_row_value(row, 'strategy_id'))}")
+        if narrative:
+            lines.append(f"  {narrative}")
     return lines
 
 
@@ -1151,7 +1344,7 @@ def _is_live_mode(mode: OperatingMode) -> bool:
 async def cmd_daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = _actor(update)
     await _record_audit(actor=actor, command="/daily_report")
-    await _reply(update, "일일 보고서: 구현 필요(요구 시 수동 호출).")
+    await _reply(update, "📈 일일 보고서\n아직 자동 보고서가 준비되지 않았습니다. 필요하면 /briefing 으로 즉시 브리핑을 요청할 수 있습니다.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1166,34 +1359,34 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         mode = await _get_runtime_mode()
         await _record_audit(actor=actor, command="/mode", payload={"mode": mode.value})
-        await _reply(update, f"운영모드: {mode.value}")
+        await _reply(update, f"🧭 운영모드\n현재: {mode.value}")
         return
 
     if len(args) < 2 or str(args[0]).lower() != "set":
         await _record_audit(actor=actor, command="/mode", payload={"args": args, "status": "invalid_usage"})
-        await _reply(update, "사용법: /mode 또는 /mode set MODE [--confirm]")
+        await _reply(update, "🧭 운영모드\n사용법: /mode 또는 /mode set MODE [--confirm]")
         return
 
     if not _allowed(update):
         await _record_audit(actor=actor, command="/mode", payload={"args": args, "status": "forbidden"})
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
 
     try:
         target_mode = normalize_mode(str(args[1]))
     except ValueError as exc:
         await _record_audit(actor=actor, command="/mode", payload={"args": args, "status": "invalid_mode"})
-        await _reply(update, str(exc))
+        await _reply(update, f"🧭 운영모드\n{exc}")
         return
 
     if _is_live_mode(target_mode) and "--confirm" not in args[2:]:
         await _record_audit(actor=actor, command="/mode", payload={"mode": target_mode.value, "status": "missing_confirm"})
-        await _reply(update, "LIVE 계열 모드는 --confirm 이 필요합니다.")
+        await _reply(update, "⚠️ LIVE 계열 모드 변경은 --confirm 이 필요합니다.")
         return
 
     await _set_runtime_mode(target_mode, actor=actor)
     await _record_audit(actor=actor, command="/mode", target_type="operating_mode", target_id=target_mode.value, payload={"status": "applied"})
-    await _reply(update, f"운영모드 변경 완료: {target_mode.value}")
+    await _reply(update, f"✅ 운영모드 변경 완료\n현재: {target_mode.value}")
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1244,7 +1437,8 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     actor = _actor(update)
     published = await _publish_control_event("daily_briefing_requested", {"actor": actor})
     await _record_audit(actor=actor, command="/briefing", payload={"published": published})
-    await _reply(update, "브리핑 트리거 접수" if published else "브리핑 트리거 접수(로컬, Redis 미연결)")
+    suffix = "요청을 워커에 전달했습니다." if published else "Redis가 연결되지 않아 로컬로만 접수했습니다."
+    await _reply(update, f"🗞️ 브리핑\n{suffix}")
 
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1252,12 +1446,12 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = list(getattr(context, "args", []) or [])
     if not _allowed(update):
         await _record_audit(actor=actor, command="/approve", target_type="order_intent", target_id=(args[0] if args else None))
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
 
     if not args:
         await _record_audit(actor=actor, command="/approve", target_type="order_intent")
-        await _reply(update, "사용법: /approve {ORDER_INTENT_ID}")
+        await _reply(update, "✅ 주문 승인\n사용법: /approve {ORDER_INTENT_ID}")
         return
 
     order_intent_id = str(args[0]).strip()
@@ -1270,7 +1464,7 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             target_id=order_intent_id,
             payload={"status": "not_pending"},
         )
-        await _reply(update, "현재 승인 대기 토큰이 없습니다.")
+        await _reply(update, "✅ 주문 승인\n현재 승인 대기 토큰이 없습니다.")
         return
 
     ok = await approve_order_intent(order_intent_id, token, environment=_environment(), redis_url=_redis_url())
@@ -1282,7 +1476,7 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         target_id=order_intent_id,
         payload={"status": status if ok else status},
     )
-    await _reply(update, "주문이 승인되었습니다." if ok else f"승인되지 않음: {status or 'unknown'}")
+    await _reply(update, f"✅ 주문 승인 완료\n{order_intent_id}" if ok else f"⚠️ 승인되지 않았습니다\n상태: {status or 'unknown'}")
 
 
 async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1290,12 +1484,12 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     args = list(getattr(context, "args", []) or [])
     if not _allowed(update):
         await _record_audit(actor=actor, command="/reject", target_type="order_intent", target_id=(args[0] if args else None))
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
 
     if not args:
         await _record_audit(actor=actor, command="/reject", target_type="order_intent")
-        await _reply(update, "사용법: /reject {ORDER_INTENT_ID}")
+        await _reply(update, "🚫 주문 거절\n사용법: /reject {ORDER_INTENT_ID}")
         return
 
     order_intent_id = str(args[0]).strip()
@@ -1307,7 +1501,7 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         target_id=order_intent_id,
         payload={"status": "RISK_REJECTED" if ok else "FAILED"},
     )
-    await _reply(update, "거부 처리되었습니다." if ok else "거부 처리 실패")
+    await _reply(update, f"🚫 주문 거절 완료\n{order_intent_id}" if ok else "⚠️ 주문 거절 처리에 실패했습니다.")
 
 
 async def cmd_why(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1315,7 +1509,7 @@ async def cmd_why(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = list(getattr(context, "args", []) or [])
     if not args:
         await _record_audit(actor=actor, command="/why", target_type="symbol")
-        await _reply(update, "사용법: /why {SYMBOL}")
+        await _reply(update, "👀 감시 사유\n사용법: /why {SYMBOL}")
         return
 
     symbol = str(args[0]).strip()
@@ -1323,13 +1517,16 @@ async def cmd_why(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _record_audit(actor=actor, command="/why", target_type="symbol", target_id=symbol)
 
     if not reports:
-        await _reply(update, f"{symbol} 관련 watch reason가 없습니다.")
+        await _reply(update, f"👀 감시 사유\n{symbol} 관련 최근 감시 사유가 없습니다.")
         return
 
     reason = reports[0].get("reason") or reports[0].get("news_summary") or reports[0].get("technical_summary")
-    lines = [f"{symbol} 왜 보고 있나?", f"사유: {reason}", "최근 신호:"]
+    lines = [f"👀 감시 사유  {symbol}", f"사유: {_fmt_text(reason, '사유 없음')}", "", "최근 신호"]
     for report in reports:
-        lines.append(f"- {report['strategy_id']} score={report['confidence']} regime={report['regime']}")
+        score = _to_decimal(report["confidence"])
+        if Decimal("0") <= score <= Decimal("1"):
+            score *= Decimal("100")
+        lines.append(f"• {report['strategy_id']} · 신뢰도 {_fmt_pct(score, signed=False)} · 국면 {_fmt_text(report['regime'], '미산출')}")
     await _reply(update, "\n".join(lines))
 
 
@@ -1339,11 +1536,18 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     manager = RiskManager()
     daily, weekly, _ = await manager.evaluate_loss_limits(_account_id(), schema=_schema())
+    daily_pct = daily.used_ratio * Decimal("100")
+    weekly_pct = weekly.used_ratio * Decimal("100")
+    usage_pct = manager.risk_usage_pct.get("daily_pct", Decimal("0"))
     lines = [
-        "리스크 현황:",
-        f"일일 손실: {daily.loss} / 제한 {daily.limit} (사용률 {daily.used_ratio * Decimal('100')}%)",
-        f"주간 손실: {weekly.loss} / 제한 {weekly.limit} (사용률 {weekly.used_ratio * Decimal('100')}%)",
-        f"실사용률: {manager.risk_usage_pct.get('daily_pct', Decimal('0'))}%",
+        "⚠️ 리스크",
+        f"일일 손실: {_fmt_money(daily.loss, signed=True)} / 한도 {_fmt_money(daily.limit)}",
+        f"{_progress_bar(daily.used_ratio)} {_fmt_pct(daily_pct, signed=False)} 사용",
+        "",
+        f"주간 손실: {_fmt_money(weekly.loss, signed=True)} / 한도 {_fmt_money(weekly.limit)}",
+        f"{_progress_bar(weekly.used_ratio)} {_fmt_pct(weekly_pct, signed=False)} 사용",
+        "",
+        f"실사용률: {_fmt_pct(usage_pct, signed=False)}",
     ]
     await _reply(update, "\n".join(lines))
 
@@ -1352,7 +1556,7 @@ async def cmd_halt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     actor = _actor(update)
     if not _allowed(update):
         await _record_audit(actor=actor, command="/halt", payload={"status": "forbidden"})
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
 
     manager = await _load_system_state_machine()
@@ -1363,7 +1567,8 @@ async def cmd_halt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         command="/halt",
         payload={"state": manager.state.value, "cancel_open_orders": True, "published": published},
     )
-    await _reply(update, f"HALT 적용: 상태={manager.state.value}, 미체결 취소 트리거={'전송' if published else '로컬'}")
+    sent_text = "전송됨" if published else "로컬 기록"
+    await _reply(update, f"🛑 HALT 적용\n상태: {manager.state.value}\n미체결 취소 트리거: {sent_text}")
 
 
 async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1371,41 +1576,41 @@ async def cmd_promote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = list(getattr(context, "args", []) or [])
     if not _allowed(update):
         await _record_audit(actor=actor, command="/promote", payload={"args": args, "status": "forbidden"})
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
 
     ok, strategy_or_error, confirmed = _parse_promote_args(args)
     if not ok:
         await _record_audit(actor=actor, command="/promote", payload={"args": args, "status": "invalid_usage"})
-        await _reply(update, str(strategy_or_error))
+        await _reply(update, f"📋 전략 승격\n{strategy_or_error}")
         return
     strategy_id = str(strategy_or_error)
 
     if not confirmed:
         await _record_audit(actor=actor, command="/promote", target_type="strategy", target_id=strategy_id, payload={"status": "missing_confirm"})
-        await _reply(update, "--confirm 이 필요합니다.")
+        await _reply(update, "⚠️ 전략 승격에는 --confirm 이 필요합니다.")
         return
 
     if not await _strategy_exists(strategy_id):
         await _record_audit(actor=actor, command="/promote", target_type="strategy", target_id=strategy_id, payload={"status": "unknown_strategy"})
-        await _reply(update, f"알 수 없는 전략: {strategy_id}")
+        await _reply(update, f"📋 전략\n알 수 없는 전략입니다: {strategy_id}")
         return
 
     if not await _history_ok_for_strategy(strategy_id):
         await _record_audit(actor=actor, command="/promote", target_type="strategy", target_id=strategy_id, payload={"status": "history_blocked"})
-        await _reply(update, f"승격 차단: {strategy_id}의 검증 이력이 부족합니다.")
+        await _reply(update, f"⚠️ 전략 승격 차단\n{strategy_id}의 검증 이력이 부족합니다.")
         return
 
     await _set_strategy_mode(strategy_id, "LIVE_AUTO", True, actor=actor)
     await _record_audit(actor=actor, command="/promote", target_type="strategy", target_id=strategy_id, payload={"mode": "LIVE_AUTO", "status": "applied"})
-    await _reply(update, f"전략 승격 완료: {strategy_id} -> LIVE_AUTO")
+    await _reply(update, f"✅ 전략 승격 완료\n{strategy_id} → LIVE_AUTO")
 
 
 async def _resume_to_mode(update: Update, target_mode: OperatingMode, command: str) -> None:
     actor = _actor(update)
     if not _allowed(update):
         await _record_audit(actor=actor, command=command, payload={"status": "forbidden"})
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
 
     manager = await _load_system_state_machine()
@@ -1413,14 +1618,14 @@ async def _resume_to_mode(update: Update, target_mode: OperatingMode, command: s
         allowed, reason = manager.can_resume_command
         if not allowed:
             await _record_audit(actor=actor, command=command, payload={"status": "blocked", "reason": reason})
-            await _reply(update, f"재개 차단: {reason}")
+            await _reply(update, f"⚠️ 재개 차단\n{reason}")
             return
         manager.human_resume(reason=command.strip("/"), actor="telegram", source=actor)
 
     await _set_runtime_mode(target_mode, actor=actor)
     published = await _publish_control_event("resume", {"actor": actor, "mode": target_mode.value, "state": manager.state.value})
     await _record_audit(actor=actor, command=command, payload={"mode": target_mode.value, "state": manager.state.value, "published": published})
-    await _reply(update, f"재개 완료: 상태={manager.state.value}, 운영모드={target_mode.value}")
+    await _reply(update, f"✅ 재개 완료\n상태: {manager.state.value}\n운영모드: {target_mode.value}")
 
 
 async def cmd_resume_live(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1436,24 +1641,24 @@ async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = list(getattr(context, "args", []) or [])
     if not _allowed(update):
         await _record_audit(actor=actor, command="/disable", payload={"args": args, "status": "forbidden"})
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
 
     ok, strategy_or_error = _parse_disable_args(args)
     if not ok:
         await _record_audit(actor=actor, command="/disable", payload={"args": args, "status": "invalid_usage"})
-        await _reply(update, str(strategy_or_error))
+        await _reply(update, f"📋 전략 비활성화\n{strategy_or_error}")
         return
     strategy_id = str(strategy_or_error)
     if not await _strategy_exists(strategy_id):
         await _record_audit(actor=actor, command="/disable", target_type="strategy", target_id=strategy_id, payload={"status": "unknown_strategy"})
-        await _reply(update, f"알 수 없는 전략: {strategy_id}")
+        await _reply(update, f"📋 전략\n알 수 없는 전략입니다: {strategy_id}")
         return
 
     current_mode, _ = await _strategy_mode_map(_dsn(), strategy_id)
     await _set_strategy_mode(strategy_id, current_mode, False, actor=actor)
     await _record_audit(actor=actor, command="/disable", target_type="strategy", target_id=strategy_id, payload={"mode": current_mode, "is_active": False})
-    await _reply(update, f"전략 비활성화 완료: {strategy_id}")
+    await _reply(update, f"⛔ 전략 비활성화 완료\n{strategy_id}")
 
 
 async def cmd_disable_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1462,11 +1667,11 @@ async def cmd_disable_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE)
     symbol = str(args[0]).strip().upper() if args else ""
     if not _allowed(update):
         await _record_audit(actor=actor, command="/disable_symbol", target_type="symbol", target_id=symbol, payload={"status": "forbidden"})
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
     if not symbol:
         await _record_audit(actor=actor, command="/disable_symbol", payload={"status": "invalid_usage"})
-        await _reply(update, "사용법: /disable_symbol CODE")
+        await _reply(update, "⛔ 종목 차단\n사용법: /disable_symbol CODE")
         return
 
     await set_trading_control(
@@ -1481,7 +1686,7 @@ async def cmd_disable_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE)
         stream_prefix=_stream_prefix(),
     )
     await _record_audit(actor=actor, command="/disable_symbol", target_type="symbol", target_id=symbol, payload={"blocked": True})
-    await _reply(update, f"종목 신규 진입 차단 완료: {symbol}")
+    await _reply(update, f"⛔ 종목 신규 진입 차단 완료\n{symbol}")
 
 
 async def cmd_disable_market(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1490,11 +1695,11 @@ async def cmd_disable_market(update: Update, context: ContextTypes.DEFAULT_TYPE)
     market = str(args[0]).strip().upper() if args else ""
     if not _allowed(update):
         await _record_audit(actor=actor, command="/disable_market", target_type="market", target_id=market, payload={"status": "forbidden"})
-        await _reply(update, "권한이 없습니다.")
+        await _reply(update, "🔒 권한이 없습니다.")
         return
     if market not in {"KR", "US"}:
         await _record_audit(actor=actor, command="/disable_market", target_type="market", target_id=market, payload={"status": "invalid_usage"})
-        await _reply(update, "사용법: /disable_market KR|US")
+        await _reply(update, "⛔ 시장 차단\n사용법: /disable_market KR|US")
         return
 
     await set_trading_control(
@@ -1509,7 +1714,7 @@ async def cmd_disable_market(update: Update, context: ContextTypes.DEFAULT_TYPE)
         stream_prefix=_stream_prefix(),
     )
     await _record_audit(actor=actor, command="/disable_market", target_type="market", target_id=market, payload={"blocked": True})
-    await _reply(update, f"시장 신규 진입 차단 완료: {market}")
+    await _reply(update, f"⛔ 시장 신규 진입 차단 완료\n{market}")
 
 
 async def _candidate_listener() -> None:
