@@ -28,3 +28,8 @@ services:
     command: ["python", "-m", "apps.worker_strategy.__main__"]
     env_file: [.env.paper]
     volumes: ["./:/app"]
+  worker-news:
+    image: stock-worker-execution:latest
+    command: ["python", "-m", "apps.worker_news.__main__"]
+    env_file: [.env.paper]
+    volumes: ["./:/app"]

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ YONHAP_INFORMAX_RSS = "https://www.yna.co.kr/rss"
 BLOOMBERG_RSS = "https://www.bloomberg.com/feeds/politics/latest.xml"
 REUTERS_RSS = "https://www.reuters.com/arc/outboundfeeds/rss/?outputType=xml"
 EDGAR_BASE_URL = "https://data.sec.gov/api/xbrl"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -246,6 +248,7 @@ class NewsCollector:
             raw = await self._fetch(session, url)
             return self._parse_rss(source, raw)
         except Exception:
+            logger.warning("RSS source fetch failed; skipping source.", extra={"source": source, "url": url}, exc_info=True)
             return []
 
     async def _collect_dart(self, session: aiohttp.ClientSession) -> list[RawNewsItem]:
@@ -286,6 +289,7 @@ class NewsCollector:
                     )
                 )
         except Exception:
+            logger.warning("DART source fetch failed; skipping source.", exc_info=True)
             return []
         return items
 
@@ -332,24 +336,37 @@ class NewsCollector:
                     )
                 )
             except Exception:
+                logger.warning("EDGAR source fetch failed; skipping symbol.", extra={"symbol": symbol}, exc_info=True)
                 continue
         return items
 
     async def collect_once(self) -> list[RawNewsItem]:
         async with aiohttp.ClientSession() as session:
-            tasks = [
-                self._collect_rss(session, "NAVER_FINANCE", NAVER_FINANCE_RSS),
-                self._collect_rss(session, "HANKYUNG", HANKYUNG_RSS),
-                self._collect_rss(session, "YONHAP_INFORMAX", YONHAP_INFORMAX_RSS),
-                self._collect_rss(session, "BLOOMBERG_RSS", BLOOMBERG_RSS),
-                self._collect_rss(session, "REUTERS_RSS", REUTERS_RSS),
-                self._collect_dart(session),
-                self._collect_edgar(session),
-            ]
-            nested = await asyncio.gather(*tasks)
+            tasks = []
+            if os.getenv("NEWS_ENABLE_RSS", "1").lower() not in {"0", "false", "no"}:
+                if os.getenv("NEWS_ENABLE_NAVER", "1").lower() not in {"0", "false", "no"}:
+                    tasks.append(self._collect_rss(session, "NAVER_FINANCE", NAVER_FINANCE_RSS))
+                if os.getenv("NEWS_ENABLE_HANKYUNG", "1").lower() not in {"0", "false", "no"}:
+                    tasks.append(self._collect_rss(session, "HANKYUNG", HANKYUNG_RSS))
+                if os.getenv("NEWS_ENABLE_YONHAP", "1").lower() not in {"0", "false", "no"}:
+                    tasks.append(self._collect_rss(session, "YONHAP_INFORMAX", YONHAP_INFORMAX_RSS))
+                if os.getenv("NEWS_ENABLE_BLOOMBERG", "1").lower() not in {"0", "false", "no"}:
+                    tasks.append(self._collect_rss(session, "BLOOMBERG_RSS", BLOOMBERG_RSS))
+                if os.getenv("NEWS_ENABLE_REUTERS", "1").lower() not in {"0", "false", "no"}:
+                    tasks.append(self._collect_rss(session, "REUTERS_RSS", REUTERS_RSS))
+            if os.getenv("NEWS_ENABLE_DART", "1").lower() not in {"0", "false", "no"}:
+                tasks.append(self._collect_dart(session))
+            if os.getenv("NEWS_ENABLE_EDGAR", "1").lower() not in {"0", "false", "no"}:
+                tasks.append(self._collect_edgar(session))
+            if not tasks:
+                return []
+            nested = await asyncio.gather(*tasks, return_exceptions=True)
 
         merged: list[RawNewsItem] = []
         for payload in nested:
+            if isinstance(payload, Exception):
+                logger.warning("News source task failed; continuing.", exc_info=(type(payload), payload, payload.__traceback__))
+                continue
             merged.extend(payload)
         return merged
 
@@ -426,7 +443,10 @@ class NewsCollector:
 
     async def run(self) -> None:
         while True:
-            await self.run_once()
+            try:
+                await self.run_once()
+            except Exception:
+                logger.warning("News collector cycle failed; continuing next poll.", exc_info=True)
             await asyncio.sleep(max(30, int(self.poll_interval_seconds)))
 
 
@@ -437,6 +457,7 @@ async def run() -> None:
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         redis_prefix=os.getenv("REDIS_STREAM_PREFIX", f"{env}.events"),
         poll_interval_seconds=int(os.getenv("NEWS_POLL_INTERVAL_SECONDS", "300")),
+        dsn=os.getenv("DATABASE_URL"),
     )
     await collector.run()
 

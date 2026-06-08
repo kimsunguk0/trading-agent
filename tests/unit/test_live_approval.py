@@ -186,5 +186,5 @@ async def test_position_mismatch_critical_publishes_emergency_stop() -> None:
     records = await monitor.check_once()
     assert len(records) == 1
     assert records[0]["severity"] == "critical"
-    monitor._persist_position_snapshot.assert_awaited_once_with("005930", Decimal("3"))
+    monitor._persist_position_snapshot.assert_awaited_once_with("005930", Decimal("3"), Decimal("3"))
     monitor._publish_emergency_stop.assert_awaited_once()

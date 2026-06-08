@@ -27,6 +27,51 @@ def _to_decimal(value: Any) -> Decimal:
     return Decimal(str(value))
 
 
+async def _maybe_await(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _first(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _position_snapshot(symbol: str, value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        normalized_symbol = str(_first(value, "symbol", "code", "stk_cd", default=symbol))
+        return {
+            "symbol": normalized_symbol,
+            "name": _first(value, "name", "symbol_name", "stk_nm", default=""),
+            "quantity": _to_decimal(_first(value, "quantity", "rmnd_qty", "hldg_qty", "qty", default="0")),
+            "average_price": _to_decimal(_first(value, "average_price", "avg_price", "pur_pric", "purchase_price", default="0")),
+            "current_price": _to_decimal(_first(value, "current_price", "market_price", "cur_prc", "price", default="0")),
+            "unrealized_pnl": _to_decimal(_first(value, "unrealized_pnl", "evltv_prft", "evlt_prft", default="0")),
+            "realized_pnl": _to_decimal(_first(value, "realized_pnl", default="0")),
+        }
+
+    quantity = getattr(value, "quantity", value)
+    return {
+        "symbol": str(getattr(value, "symbol", symbol)),
+        "name": str(getattr(value, "name", "")),
+        "quantity": _to_decimal(quantity),
+        "average_price": _to_decimal(getattr(value, "average_price", Decimal("0"))),
+        "current_price": _to_decimal(getattr(value, "current_price", Decimal("0"))),
+        "unrealized_pnl": _to_decimal(getattr(value, "unrealized_pnl", Decimal("0"))),
+        "realized_pnl": _to_decimal(getattr(value, "realized_pnl", Decimal("0"))),
+    }
+
+
+def _position_quantity(value: Any) -> Decimal:
+    if isinstance(value, dict):
+        return _to_decimal(value.get("quantity"))
+    return _to_decimal(value)
+
+
 def _select_broker() -> object:
     adapter = __import__("os").getenv("BROKER_ADAPTER", "simulated").lower()
     if adapter == "kiwoom_mock":
@@ -82,29 +127,38 @@ class ReconciliationMonitor:
         finally:
             await conn.close()
 
-    async def _fetch_broker_positions(self) -> dict[str, Decimal]:
+    async def _fetch_broker_positions(self) -> dict[str, dict[str, Any]]:
         if hasattr(self.broker, "get_positions") and callable(self.broker.get_positions):
-            positions = await self.broker.get_positions(self.account_id)  # type: ignore[misc]
+            positions = await _maybe_await(self.broker.get_positions(self.account_id))  # type: ignore[misc]
             if isinstance(positions, dict):
-                normalized: dict[str, Decimal] = {}
+                normalized: dict[str, dict[str, Any]] = {}
                 for symbol, value in positions.items():
+                    snapshot = _position_snapshot(str(symbol), value)
+                    normalized[str(snapshot.get("symbol") or symbol)] = snapshot
+                return normalized
+            if isinstance(positions, list):
+                normalized = {}
+                for value in positions:
                     if isinstance(value, dict):
-                        normalized[str(symbol)] = _to_decimal(value.get("quantity"))
+                        snapshot = _position_snapshot(str(value.get("symbol", "")), value)
                     else:
-                        normalized[str(symbol)] = _to_decimal(value)
+                        snapshot = _position_snapshot(str(getattr(value, "symbol", "")), value)
+                    symbol = str(snapshot.get("symbol") or "")
+                    if symbol:
+                        normalized[symbol] = snapshot
                 return normalized
 
         mapping = getattr(self.broker, "_positions", {})
         if isinstance(mapping, dict):
-            values: dict[str, Decimal] = {}
+            values: dict[str, dict[str, Any]] = {}
             for key, value in mapping.items():
                 if isinstance(key, tuple) and len(key) >= 2:
                     account_id, symbol = key[0], key[1]
                     if str(account_id) != self.account_id:
                         continue
-                    values[str(symbol)] = _to_decimal(getattr(value, "quantity", value))
+                    values[str(symbol)] = _position_snapshot(str(symbol), value)
                 else:
-                    values[str(key)] = _to_decimal(value)
+                    values[str(key)] = _position_snapshot(str(key), value)
             return values
 
         return {}
@@ -132,13 +186,18 @@ class ReconciliationMonitor:
         finally:
             await conn.close()
 
-    async def _persist_position_snapshot(self, symbol: str, quantity: Decimal) -> None:
+    async def _persist_position_snapshot(self, symbol: str, quantity: Decimal, broker_position: Any | None = None) -> None:
         if not self.dsn:
             return
 
-        avg_price = await self._latest_price(symbol)
+        snapshot = _position_snapshot(symbol, broker_position if broker_position is not None else quantity)
+        avg_price = _to_decimal(snapshot.get("average_price"))
+        if avg_price <= Decimal("0"):
+            avg_price = await self._latest_price(symbol)
+        realized_pnl = _to_decimal(snapshot.get("realized_pnl"))
         conn = await asyncpg.connect(self.dsn)
         try:
+            now = datetime.now(timezone.utc)
             await conn.execute(
                 f"""
                 INSERT INTO {self.schema}.position_snapshots (
@@ -154,8 +213,8 @@ class ReconciliationMonitor:
                 symbol,
                 str(quantity),
                 str(avg_price),
-                str(Decimal("0")),
-                datetime.now(timezone.utc),
+                str(realized_pnl),
+                now,
             )
         finally:
             await conn.close()
@@ -244,22 +303,26 @@ class ReconciliationMonitor:
 
         for symbol in sorted(symbols):
             internal_qty = _to_decimal(internal.get(symbol, Decimal("0")))
-            broker_qty = _to_decimal(broker.get(symbol, Decimal("0")))
+            broker_position = broker.get(symbol, {"quantity": Decimal("0")})
+            broker_qty = _position_quantity(broker_position)
             diff = broker_qty - internal_qty
             abs_diff = diff.copy_abs()
 
             if abs_diff >= Decimal("1"):
                 severity = "critical"
                 action = "emergency_stop"
-                await self._persist_position_snapshot(symbol, broker_qty)
+                await self._persist_position_snapshot(symbol, broker_qty, broker_position)
                 await self._publish_emergency_stop(symbol, diff)
             elif abs_diff > Decimal("0"):
                 severity = "warning"
                 action = "positions_updated_from_broker"
-                await self._persist_position_snapshot(symbol, broker_qty)
+                await self._persist_position_snapshot(symbol, broker_qty, broker_position)
             else:
                 severity = "ok"
                 action = "no_action"
+                if symbol in broker and broker_qty > Decimal("0"):
+                    action = "broker_snapshot_synced"
+                    await self._persist_position_snapshot(symbol, broker_qty, broker_position)
 
             await self._write_reconciliation_log(
                 symbol_code=symbol,

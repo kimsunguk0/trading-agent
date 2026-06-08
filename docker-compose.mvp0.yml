@@ -1,7 +1,7 @@
 # MVP 0 docker-compose
 #
 # 외부 API 0개. SimulatedBrokerAdapter로 풀 사이클 검증.
-# 8개 컨테이너: postgres, redis, minio + api, worker-market, worker-execution, worker-monitor, bot-telegram
+# 주요 컨테이너: postgres, redis, minio + api, worker-market, worker-news, worker-execution, worker-monitor, bot-telegram
 #
 # 실행:
 #   docker compose -f docker-compose.base.yml -f docker-compose.paper.yml --env-file .env.paper up -d
@@ -270,6 +270,45 @@ services:
       resources:
         limits:
           memory: 2G
+
+  worker-news:
+    build:
+      context: .
+      dockerfile: apps/worker_news/Dockerfile
+    <<: *worker-restart
+    environment:
+      <<: *common-env
+      WORKER_NAME: worker-news
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_PREFIX: ${ENVIRONMENT}.events
+      NEWS_POLL_INTERVAL_SECONDS: ${NEWS_POLL_INTERVAL_SECONDS:-300}
+      NEWS_ENABLE_RSS: ${NEWS_ENABLE_RSS:-1}
+      NEWS_ENABLE_NAVER: ${NEWS_ENABLE_NAVER:-1}
+      NEWS_ENABLE_HANKYUNG: ${NEWS_ENABLE_HANKYUNG:-1}
+      NEWS_ENABLE_YONHAP: ${NEWS_ENABLE_YONHAP:-1}
+      NEWS_ENABLE_BLOOMBERG: ${NEWS_ENABLE_BLOOMBERG:-1}
+      NEWS_ENABLE_REUTERS: ${NEWS_ENABLE_REUTERS:-1}
+      NEWS_ENABLE_DART: ${NEWS_ENABLE_DART:-1}
+      NEWS_ENABLE_EDGAR: ${NEWS_ENABLE_EDGAR:-1}
+      DART_API_KEY: ${DART_API_KEY:-}
+      EDGAR_SYMBOLS: ${EDGAR_SYMBOLS:-}
+      EDGAR_CIK_MAP: ${EDGAR_CIK_MAP:-}
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "from agents.collectors.news_collector import NewsCollector; NewsCollector(); print('ok')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks: [trading_net]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
   qdrant:
     image: qdrant/qdrant:latest
