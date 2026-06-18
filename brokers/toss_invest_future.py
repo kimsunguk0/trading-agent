@@ -130,6 +130,11 @@ def _strip_code(value: Any) -> str:
     return str(value or "").strip().upper()
 
 
+def _looks_like_account_seq(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.isdigit() and 0 < len(text) <= 6
+
+
 def _basic_auth_header(app_key: str, app_secret: str) -> str:
     raw = f"{app_key}:{app_secret}".encode("utf-8")
     return "Basic " + base64.b64encode(raw).decode("ascii")
@@ -172,8 +177,6 @@ class TossInvestAdapter:
         self.account_no = account_no or os.getenv("TOSS_ACCOUNT_NO", "")
         if not self.app_key or not self.app_secret:
             raise ValueError("TOSS_APP_KEY/TOSS_APP_SECRET are required")
-        if not self.account_no:
-            raise ValueError("TOSS_ACCOUNT_NO is required")
 
         self.base_url = (base_url or os.getenv("TOSS_BASE_URL") or self.default_base_url).rstrip("/")
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=10.0, transport=transport)
@@ -181,6 +184,7 @@ class TossInvestAdapter:
         self._request_times: list[float] = []
         self._access_token: str | None = None
         self._access_token_expires_at: datetime | None = None
+        self._account_seq: str | None = None
         self._order_mapping: dict[str, str] = {}
         self._last_order_ack: dict[str, OrderAck] = {}
 
@@ -230,12 +234,46 @@ class TossInvestAdapter:
         if await self._needs_refresh():
             await self._request_access_token()
 
-    def _headers(self, *, account: bool = False, content_type: bool = False) -> dict[str, str]:
+    async def _resolve_account_seq(self) -> str:
+        if self._account_seq:
+            return self._account_seq
+
+        configured = str(self.account_no or "").strip()
+        if _looks_like_account_seq(configured):
+            self._account_seq = configured
+            return self._account_seq
+
+        payload = await self._get("/api/v1/accounts", account=False)
+        rows = _as_list(payload, "result", "accounts", "accountList", "items")
+        if not rows:
+            raise TossApiError("-1", "account list response is empty", {"raw": str(payload)})
+
+        selected = None
+        if configured:
+            selected = next(
+                (
+                    row
+                    for row in rows
+                    if str(_first(row, "accountNo", "accountNumber", "account_no", default="")).strip()
+                    == configured
+                ),
+                None,
+            )
+        if selected is None:
+            selected = rows[0]
+
+        account_seq = _first(selected, "accountSeq", "account_seq", "seq", "id")
+        if account_seq in (None, ""):
+            raise TossApiError("-1", "account list response does not include accountSeq", selected)
+        self._account_seq = str(account_seq)
+        return self._account_seq
+
+    async def _headers(self, *, account: bool = False, content_type: bool = False) -> dict[str, str]:
         if not self._access_token:
             raise TossApiError("-1", "access token is not initialized")
         headers = {"Authorization": f"Bearer {self._access_token}"}
         if account:
-            headers["X-Tossinvest-Account"] = self.account_no
+            headers["X-Tossinvest-Account"] = await self._resolve_account_seq()
         if content_type:
             headers["Content-Type"] = "application/json"
         return headers
@@ -243,7 +281,7 @@ class TossInvestAdapter:
     async def _get(self, path: str, *, params: dict[str, Any] | None = None, account: bool = False) -> dict[str, Any] | list[Any]:
         await self._rate_limit_wait()
         await self._ensure_access_token()
-        response = await self._client.get(path, params=params or {}, headers=self._headers(account=account))
+        response = await self._client.get(path, params=params or {}, headers=await self._headers(account=account))
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, (dict, list)):
@@ -256,7 +294,7 @@ class TossInvestAdapter:
         response = await self._client.post(
             path,
             json=body,
-            headers=self._headers(account=account, content_type=True),
+            headers=await self._headers(account=account, content_type=True),
         )
         response.raise_for_status()
         payload = response.json()
@@ -270,7 +308,7 @@ class TossInvestAdapter:
         response = await self._client.patch(
             path,
             json=body,
-            headers=self._headers(account=account, content_type=True),
+            headers=await self._headers(account=account, content_type=True),
         )
         response.raise_for_status()
         payload = response.json()
@@ -279,7 +317,7 @@ class TossInvestAdapter:
     async def _delete(self, path: str, *, account: bool = False) -> dict[str, Any]:
         await self._rate_limit_wait()
         await self._ensure_access_token()
-        response = await self._client.delete(path, headers=self._headers(account=account))
+        response = await self._client.delete(path, headers=await self._headers(account=account))
         response.raise_for_status()
         if not response.content:
             return {}

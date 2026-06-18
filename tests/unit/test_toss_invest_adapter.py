@@ -113,34 +113,42 @@ async def test_toss_get_positions_uses_holdings_endpoint_and_parses_items() -> N
         if request.url.path == "/oauth2/token":
             return httpx.Response(200, json=_token_payload())
         assert request.headers["Authorization"] == "Bearer TOSS-TOKEN"
-        assert request.headers["X-Tossinvest-Account"] == "ACC-1"
+        if request.url.path == "/api/v1/accounts":
+            assert "X-Tossinvest-Account" not in request.headers
+            return httpx.Response(
+                200,
+                json={"result": [{"accountNo": "11101040062", "accountSeq": 1, "accountType": "BROKERAGE"}]},
+            )
         if request.url.path == "/api/v1/holdings":
+            assert request.headers["X-Tossinvest-Account"] == "1"
             return httpx.Response(
                 200,
                 json={
-                    "totalPurchaseAmount": {"krw": "140000", "usd": "0"},
-                    "marketValue": {"amount": {"krw": "143000", "usd": "0"}},
-                    "profitLoss": {"amount": {"krw": "3000", "usd": "0"}, "rate": "2.14"},
-                    "items": [
-                        {
-                            "symbol": "005930",
-                            "name": "삼성전자",
-                            "quantity": "2",
-                            "lastPrice": "71500",
-                            "averagePurchasePrice": "70000",
-                            "marketValue": {
-                                "purchaseAmount": "140000",
-                                "amount": "143000",
-                                "amountAfterCost": "142900",
-                            },
-                            "profitLoss": {
-                                "amount": "3000",
-                                "amountAfterCost": "2900",
-                                "rate": "2.14",
-                                "rateAfterCost": "2.07",
-                            },
-                        }
-                    ]
+                    "result": {
+                        "totalPurchaseAmount": {"krw": "140000", "usd": "0"},
+                        "marketValue": {"amount": {"krw": "143000", "usd": "0"}},
+                        "profitLoss": {"amount": {"krw": "3000", "usd": "0"}, "rate": "2.14"},
+                        "items": [
+                            {
+                                "symbol": "005930",
+                                "name": "삼성전자",
+                                "quantity": "2",
+                                "lastPrice": "71500",
+                                "averagePurchasePrice": "70000",
+                                "marketValue": {
+                                    "purchaseAmount": "140000",
+                                    "amount": "143000",
+                                    "amountAfterCost": "142900",
+                                },
+                                "profitLoss": {
+                                    "amount": {"krw": "3000", "usd": "0"},
+                                    "amountAfterCost": {"krw": "2900", "usd": "0"},
+                                    "rate": "2.14",
+                                    "rateAfterCost": "2.07",
+                                },
+                            }
+                        ],
+                    }
                 },
             )
         raise AssertionError(f"unexpected path {request.url.path}")
@@ -148,11 +156,12 @@ async def test_toss_get_positions_uses_holdings_endpoint_and_parses_items() -> N
     adapter = TossInvestAdapter(
         app_key="app",
         app_secret="sec",
-        account_no="ACC-1",
+        account_no="11101040062",
         transport=httpx.MockTransport(handler),
     )
 
     positions = await adapter.get_positions("ACC-1")
+    positions_again = await adapter.get_positions("ACC-1")
 
     assert positions["005930"]["quantity"] == Decimal("2")
     assert positions["005930"]["average_price"] == Decimal("70000")
@@ -163,8 +172,73 @@ async def test_toss_get_positions_uses_holdings_endpoint_and_parses_items() -> N
     assert positions["005930"]["purchase_amount"] == Decimal("140000")
     assert {request.url.path for request in requests} >= {
         "/oauth2/token",
+        "/api/v1/accounts",
         "/api/v1/holdings",
     }
+    assert positions_again["005930"]["average_price"] == Decimal("70000")
+    assert len([request for request in requests if request.url.path == "/api/v1/accounts"]) == 1
+    assert len([request for request in requests if request.url.path == "/api/v1/holdings"]) == 2
+    assert adapter._account_seq == "1"
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_toss_account_seq_falls_back_to_first_account_when_no_match() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(200, json=_token_payload())
+        if request.url.path == "/api/v1/accounts":
+            return httpx.Response(
+                200,
+                json={"result": [{"accountNo": "11101040062", "accountSeq": 7, "accountType": "BROKERAGE"}]},
+            )
+        if request.url.path == "/api/v1/holdings":
+            assert request.headers["X-Tossinvest-Account"] == "7"
+            return httpx.Response(200, json={"result": {"items": []}})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = TossInvestAdapter(
+        app_key="app",
+        app_secret="sec",
+        account_no="99999999999",
+        transport=httpx.MockTransport(handler),
+    )
+
+    positions = await adapter.get_positions("ACC-1")
+
+    assert positions == {}
+    assert adapter._account_seq == "7"
+    assert len([request for request in requests if request.url.path == "/api/v1/accounts"]) == 1
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_toss_account_seq_falls_back_to_first_account_when_account_no_missing() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth2/token":
+            return httpx.Response(200, json=_token_payload())
+        if request.url.path == "/api/v1/accounts":
+            return httpx.Response(
+                200,
+                json={"result": [{"accountNo": "11101040062", "accountSeq": 3, "accountType": "BROKERAGE"}]},
+            )
+        if request.url.path == "/api/v1/holdings":
+            assert request.headers["X-Tossinvest-Account"] == "3"
+            return httpx.Response(200, json={"result": {"items": []}})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = TossInvestAdapter(
+        app_key="app",
+        app_secret="sec",
+        account_no="",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert await adapter.get_positions("ACC-1") == {}
+    assert adapter._account_seq == "3"
     await adapter.close()
 
 
@@ -188,7 +262,7 @@ async def test_toss_orderbook_defensive_parsing() -> None:
     adapter = TossInvestAdapter(
         app_key="app",
         app_secret="sec",
-        account_no="ACC-1",
+        account_no="1",
         transport=httpx.MockTransport(handler),
     )
 
@@ -210,7 +284,7 @@ async def test_toss_submit_order_posts_account_header_and_order_json() -> None:
         assert request.method == "POST"
         assert request.url.path == "/api/v1/orders"
         assert request.headers["Authorization"] == "Bearer TOSS-TOKEN"
-        assert request.headers["X-Tossinvest-Account"] == "ACC-1"
+        assert request.headers["X-Tossinvest-Account"] == "1"
         assert request.headers["Content-Type"] == "application/json"
         assert json.loads(request.content) == {
             "symbol": "005930",
@@ -228,7 +302,7 @@ async def test_toss_submit_order_posts_account_header_and_order_json() -> None:
     adapter = TossInvestAdapter(
         app_key="app",
         app_secret="sec",
-        account_no="ACC-1",
+        account_no="1",
         transport=httpx.MockTransport(handler),
     )
 
@@ -248,5 +322,6 @@ async def test_toss_submit_order_posts_account_header_and_order_json() -> None:
     assert ack.order_intent_id == "OI-1"
     assert ack.status == OrderStatus.SUBMITTED
     assert len([request for request in requests if request.url.path == "/api/v1/orders"]) == 1
+    assert not [request for request in requests if request.url.path == "/api/v1/accounts"]
     assert adapter.capabilities.supports_client_order_id is True
     await adapter.close()
