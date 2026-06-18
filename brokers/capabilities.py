@@ -160,3 +160,25 @@ KIS_US_LIVE_CAPS = BrokerCapabilities(
     market_close_utc=_to_hhmm(2100),
     supports_extended_hours=True,
 )
+
+TOSS_CAPS = BrokerCapabilities(
+    name="toss_invest",
+    broker="toss",
+    market="KR,US",
+    environment="live",
+    supports_market_order=True,
+    supports_limit_order=True,
+    supports_partial_fill=True,
+    can_query_order_status=True,
+    supports_cancel_order=True,
+    supports_client_order_id=True,
+    supports_fractional_quantity=False,
+    min_order_quantity=Decimal("1"),
+    supports_stop_order=False,
+    supported_time_in_force=frozenset({"DAY", "CLS"}),
+    max_requests_per_second=5,
+    market_open_utc=_to_hhmm(0),
+    market_close_utc=_to_hhmm(630),
+    supports_extended_hours=False,
+    simulated=False,
+)

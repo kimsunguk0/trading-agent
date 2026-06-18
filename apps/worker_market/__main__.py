@@ -20,6 +20,7 @@ from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
 from brokers.kis_overseas_live import KISOverseasLiveAdapter
 from brokers.kis_overseas_mock import KISOverseasMockAdapter
 from brokers.simulated import SimulatedBrokerAdapter
+from brokers.toss_invest_future import TossInvestAdapter
 from core.clock import is_market_open
 from core.events.bus import RedisStreamBus
 from core.events.schemas import EventType, MarketTickEvent
@@ -105,6 +106,9 @@ def _iter_symbols() -> list[str]:
 def _select_broker() -> tuple[object, bool]:
     adapter_name = os.getenv("BROKER_ADAPTER", "simulated").lower()
     market = _market_from_env()
+
+    if adapter_name in {"toss", "toss_invest", "toss_invest_live"}:
+        return TossInvestAdapter(), False
 
     if market == "US":
         if adapter_name in {"kis_overseas_live", "kis_live"}:
@@ -244,7 +248,7 @@ async def _watch_streamed(
 
 
 async def _watch_polling(
-    broker: KISOverseasMockAdapter | KISOverseasLiveAdapter,
+    broker: KISOverseasMockAdapter | KISOverseasLiveAdapter | TossInvestAdapter,
     symbols: list[str],
     market: str,
 ) -> AsyncIterator[MarketTickEvent]:
@@ -328,7 +332,7 @@ async def main() -> None:
     try:
         if isinstance(broker, (KiwoomRestKrMockAdapter, KiwoomRestKrLiveAdapter, KISDomesticKrMockAdapter, KISDomesticKrLiveAdapter)):
             tick_iter = _watch_streamed(broker, symbols, market)
-        elif isinstance(broker, (KISOverseasMockAdapter, KISOverseasLiveAdapter)):
+        elif isinstance(broker, (KISOverseasMockAdapter, KISOverseasLiveAdapter, TossInvestAdapter)):
             tick_iter = _watch_polling(broker, symbols, market)
         else:
             tick_iter = _watch_simulated(broker, symbols, market)

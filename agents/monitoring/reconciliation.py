@@ -15,6 +15,7 @@ from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
 from brokers.kiwoom_rest_kr_live import KiwoomRestKrLiveAdapter
 from brokers.kiwoom_rest_kr_mock import KiwoomRestKrMockAdapter
 from brokers.simulated import SimulatedBrokerAdapter
+from brokers.toss_invest_future import TossInvestAdapter
 from core.events.bus import RedisStreamBus
 from core.events.schemas import EventType, RiskEvent
 
@@ -82,6 +83,8 @@ def _select_broker() -> object:
         return KISDomesticKrMockAdapter()
     if adapter in {"kis_kr_live", "kis_domestic_live", "kis_domestic_kr_live"}:
         return KISDomesticKrLiveAdapter()
+    if adapter in {"toss", "toss_invest", "toss_invest_live"}:
+        return TossInvestAdapter()
     return SimulatedBrokerAdapter()
 
 

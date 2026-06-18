@@ -18,6 +18,7 @@ from agents.decision.strategy_engine import StrategyEngine
 from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
 from brokers.kiwoom_rest_kr_mock import KiwoomRestKrMockAdapter
 from brokers.simulated import SimulatedBrokerAdapter
+from brokers.toss_invest_future import TossInvestAdapter
 from core.events.bus import RedisStreamBus
 from core.events.schemas import EventType, MarketTickEvent
 
@@ -49,6 +50,8 @@ def _select_broker() -> object:
         return KiwoomRestKrMockAdapter()
     if adapter_name in {"kis_kr_mock", "kis_domestic_mock", "kis_domestic_kr_mock"}:
         return KISDomesticKrMockAdapter()
+    if adapter_name in {"toss", "toss_invest", "toss_invest_live"}:
+        return TossInvestAdapter()
     return SimulatedBrokerAdapter()
 
 

@@ -76,6 +76,8 @@ def _infer_broker_key_env(environment: str) -> str:
     adapter = os.getenv("BROKER_ADAPTER", "simulated").strip().lower()
     if "live" in adapter:
         return "live"
+    if adapter in {"toss", "toss_invest", "toss_invest_live"}:
+        return "live"
     if any(token in adapter for token in ("mock", "paper", "virtual")):
         return "paper"
     if adapter == "simulated":
@@ -89,6 +91,9 @@ def _infer_broker_key_env(environment: str) -> str:
             "KIS_LIVE_APP_KEY",
             "KIS_LIVE_APP_SECRET",
             "KIS_LIVE_ACCOUNT_NO",
+            "TOSS_APP_KEY",
+            "TOSS_APP_SECRET",
+            "TOSS_ACCOUNT_NO",
         )
     )
     paper_keys_present = _non_empty_env_any(
@@ -119,6 +124,9 @@ def _assert_no_cross_environment_credentials(environment: str) -> None:
             "KIS_LIVE_APP_KEY",
             "KIS_LIVE_APP_SECRET",
             "KIS_LIVE_ACCOUNT_NO",
+            "TOSS_APP_KEY",
+            "TOSS_APP_SECRET",
+            "TOSS_ACCOUNT_NO",
         )
     )
     paper_keys_present = _non_empty_env_any(

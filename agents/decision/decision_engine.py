@@ -365,12 +365,15 @@ async def main() -> None:
     from brokers.kis_domestic_kr_mock import KISDomesticKrMockAdapter
     from brokers.simulated import SimulatedBrokerAdapter
     from brokers.kiwoom_rest_kr_mock import KiwoomRestKrMockAdapter
+    from brokers.toss_invest_future import TossInvestAdapter
 
     adapter_name = os.getenv("BROKER_ADAPTER", "simulated").lower()
     if adapter_name == "kiwoom_mock":
         broker = KiwoomRestKrMockAdapter()
     elif adapter_name in {"kis_kr_mock", "kis_domestic_mock", "kis_domestic_kr_mock"}:
         broker = KISDomesticKrMockAdapter()
+    elif adapter_name in {"toss", "toss_invest", "toss_invest_live"}:
+        broker = TossInvestAdapter()
     else:
         broker = SimulatedBrokerAdapter()
 

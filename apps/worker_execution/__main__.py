@@ -39,6 +39,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency fallback
     KISDomesticKrLiveAdapter = None
 
+try:
+    from brokers.toss_invest_future import TossInvestAdapter
+except ImportError:  # pragma: no cover - optional dependency fallback
+    TossInvestAdapter = None
+
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +92,11 @@ def _select_broker() -> tuple[object, bool]:
         except Exception:
             logger.warning("Failed to initialize KIS KR live adapter; using simulated broker.", exc_info=True)
             return SimulatedBrokerAdapter(), True
+    elif adapter_name in {"toss", "toss_invest", "toss_invest_live"} and TossInvestAdapter is not None:
+        adapter = TossInvestAdapter()
+    elif adapter_name in {"toss", "toss_invest", "toss_invest_live"}:
+        logger.warning("Toss Invest adapter import failed; using simulated-only mode.")
+        return SimulatedBrokerAdapter(), True
     else:
         adapter = SimulatedBrokerAdapter()
 
